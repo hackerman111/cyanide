@@ -229,7 +229,13 @@ impl MainWindow {
         let guides_btn = gtk4::ToggleButton::with_label("Направл.");
         let mirror_btn = gtk4::ToggleButton::with_label("Зеркало");
         let freeze_btn = gtk4::ToggleButton::with_label("Стоп-кадр");
-        for b in [&grid_btn, &center_btn, &guides_btn, &mirror_btn, &freeze_btn] {
+        for b in [
+            &grid_btn,
+            &center_btn,
+            &guides_btn,
+            &mirror_btn,
+            &freeze_btn,
+        ] {
             row1.append(b);
         }
         toolbar_box.append(&row1);
@@ -282,26 +288,123 @@ impl MainWindow {
         left_box.append(&toolbar_box);
 
         // Wire compare toolbar signals
-        wire_compare_toggle(&mode_overlay_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, active| {
-            if active { c.mode = CompareMode::Overlay; }
-        });
-        wire_compare_toggle(&mode_side_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, active| {
-            if active { c.mode = CompareMode::SideBySide; }
-        });
-        wire_compare_toggle(&mode_split_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, active| {
-            if active { c.mode = CompareMode::Split; }
-        });
-        wire_compare_toggle(&grid_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, a| c.show_grid = a);
-        wire_compare_toggle(&center_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, a| c.show_center = a);
-        wire_compare_toggle(&guides_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, a| c.show_guides = a);
-        wire_compare_toggle(&mirror_btn, &syncing, &compare_cfg, &compare_view, &on_action, |c, a| c.mirror = a);
+        wire_compare_toggle(
+            &mode_overlay_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, active| {
+                if active {
+                    c.mode = CompareMode::Overlay;
+                }
+            },
+        );
+        wire_compare_toggle(
+            &mode_side_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, active| {
+                if active {
+                    c.mode = CompareMode::SideBySide;
+                }
+            },
+        );
+        wire_compare_toggle(
+            &mode_split_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, active| {
+                if active {
+                    c.mode = CompareMode::Split;
+                }
+            },
+        );
+        wire_compare_toggle(
+            &grid_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, a| c.show_grid = a,
+        );
+        wire_compare_toggle(
+            &center_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, a| c.show_center = a,
+        );
+        wire_compare_toggle(
+            &guides_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, a| c.show_guides = a,
+        );
+        wire_compare_toggle(
+            &mirror_btn,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, a| c.mirror = a,
+        );
 
-        wire_compare_scale(&opacity_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.opacity = v);
-        wire_compare_scale(&zoom_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.zoom = v);
-        wire_compare_scale(&pan_x_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.pan_x = v);
-        wire_compare_scale(&pan_y_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.pan_y = v);
-        wire_compare_scale(&guide_x_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.guide_x = v);
-        wire_compare_scale(&guide_y_scale, &syncing, &compare_cfg, &compare_view, &on_action, |c, v| c.guide_y = v);
+        wire_compare_scale(
+            &opacity_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.opacity = v,
+        );
+        wire_compare_scale(
+            &zoom_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.zoom = v,
+        );
+        wire_compare_scale(
+            &pan_x_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.pan_x = v,
+        );
+        wire_compare_scale(
+            &pan_y_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.pan_y = v,
+        );
+        wire_compare_scale(
+            &guide_x_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.guide_x = v,
+        );
+        wire_compare_scale(
+            &guide_y_scale,
+            &syncing,
+            &compare_cfg,
+            &compare_view,
+            &on_action,
+            |c, v| c.guide_y = v,
+        );
 
         {
             let act = Rc::clone(&on_action);
@@ -350,7 +453,8 @@ impl MainWindow {
         content_box.append(&banner);
         content_box.append(&body);
 
-        let footer_label = gtk4::Label::new(Some("Режим трансляции: Настоящая камера · Аудио: Микрофон"));
+        let footer_label =
+            gtk4::Label::new(Some("Режим трансляции: Настоящая камера · Аудио: Микрофон"));
         footer_label.set_xalign(0.0);
         footer_label.set_margin_top(6);
         footer_label.set_margin_bottom(6);
@@ -449,8 +553,9 @@ impl MainWindow {
         };
 
         self.status_pill.set_label(&format!("● {mode_text}"));
-        self.footer_label
-            .set_label(&format!("Режим трансляции: {mode_text} · Аудио: {audio_text}"));
+        self.footer_label.set_label(&format!(
+            "Режим трансляции: {mode_text} · Аудио: {audio_text}"
+        ));
 
         let cam_label = cfg.real_camera.as_deref().unwrap_or("нет камеры");
         self.live_info_label.set_label(&format!(

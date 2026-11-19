@@ -71,7 +71,9 @@ fn detect_loopback(video_dir: &Path, name: &str) -> bool {
         return true;
     }
     if let Ok(canonical) = std::fs::canonicalize(video_dir)
-        && canonical.to_string_lossy().contains("/devices/virtual/video4linux")
+        && canonical
+            .to_string_lossy()
+            .contains("/devices/virtual/video4linux")
     {
         return true;
     }

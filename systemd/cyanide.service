@@ -1,0 +1,13 @@
+[Unit]
+Description=Cyanide VirtualCam & VirtualMic Studio (background daemon)
+After=graphical-session.target pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/cyanide --background
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -8,7 +8,9 @@ use libadwaita::prelude::*;
 use crate::config::{Config, LoopReturnPolicy, StartupMode, VideoFormat};
 use crate::devices::DeviceInventory;
 use crate::gui::{ConfigPatch, UiAction};
-use crate::state::{AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource};
+use crate::state::{
+    AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource,
+};
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
     (640, 480, "640×480"),
@@ -73,13 +75,19 @@ impl ControlPanel {
         let preset_live = gtk4::Button::with_label("Режим Live");
         {
             let act = Rc::clone(&on_action);
-            preset_loop.connect_clicked(move |_| act(UiAction::Command(Command::SetMode(StreamMode::Loop))));
+            preset_loop.connect_clicked(move |_| {
+                act(UiAction::Command(Command::SetMode(StreamMode::Loop)))
+            });
             let act = Rc::clone(&on_action);
-            preset_live.connect_clicked(move |_| act(UiAction::Command(Command::SetMode(StreamMode::Live))));
+            preset_live.connect_clicked(move |_| {
+                act(UiAction::Command(Command::SetMode(StreamMode::Live)))
+            });
         }
         preset_box.append(&preset_loop);
         preset_box.append(&preset_live);
-        let preset_row = adw::ActionRow::builder().title("Быстрое переключение").build();
+        let preset_row = adw::ActionRow::builder()
+            .title("Быстрое переключение")
+            .build();
         preset_row.add_suffix(&preset_box);
         routing_group.add(&preset_row);
 
@@ -161,7 +169,10 @@ impl ControlPanel {
 
         let startup_combo = adw::ComboRow::builder()
             .title("Режим при старте")
-            .model(&gtk4::StringList::new(&["Настоящая камера", "Зацикленное видео"]))
+            .model(&gtk4::StringList::new(&[
+                "Настоящая камера",
+                "Зацикленное видео",
+            ]))
             .build();
         {
             let act = Rc::clone(&on_action);
@@ -241,7 +252,9 @@ impl ControlPanel {
                     return;
                 }
                 if let Some(p) = paths.borrow().get(c.selected() as usize) {
-                    act(UiAction::UpdateConfig(ConfigPatch::RealCamera(Some(p.clone()))));
+                    act(UiAction::UpdateConfig(ConfigPatch::RealCamera(Some(
+                        p.clone(),
+                    ))));
                 }
             });
         }
@@ -257,7 +270,9 @@ impl ControlPanel {
                     return;
                 }
                 if let Some(p) = paths.borrow().get(c.selected() as usize) {
-                    act(UiAction::UpdateConfig(ConfigPatch::VirtualCamera(Some(p.clone()))));
+                    act(UiAction::UpdateConfig(ConfigPatch::VirtualCamera(Some(
+                        p.clone(),
+                    ))));
                 }
             });
         }
@@ -273,7 +288,9 @@ impl ControlPanel {
                     return;
                 }
                 if let Some(n) = names.borrow().get(c.selected() as usize) {
-                    act(UiAction::UpdateConfig(ConfigPatch::RealMic(Some(n.clone()))));
+                    act(UiAction::UpdateConfig(ConfigPatch::RealMic(Some(
+                        n.clone(),
+                    ))));
                 }
             });
         }
@@ -299,12 +316,17 @@ impl ControlPanel {
                     return;
                 }
                 if let Some(&(w, h, _)) = RESOLUTIONS.get(c.selected() as usize) {
-                    let fps = FPS_OPTIONS.get(fps_c.selected() as usize).copied().unwrap_or(30);
-                    act(UiAction::UpdateConfig(ConfigPatch::VideoFormat(VideoFormat {
-                        width: w,
-                        height: h,
-                        fps,
-                    })));
+                    let fps = FPS_OPTIONS
+                        .get(fps_c.selected() as usize)
+                        .copied()
+                        .unwrap_or(30);
+                    act(UiAction::UpdateConfig(ConfigPatch::VideoFormat(
+                        VideoFormat {
+                            width: w,
+                            height: h,
+                            fps,
+                        },
+                    )));
                 }
             });
             let act = Rc::clone(&on_action);
@@ -315,12 +337,16 @@ impl ControlPanel {
                     return;
                 }
                 if let Some(&fps) = FPS_OPTIONS.get(c.selected() as usize) {
-                    let &(w, h, _) = RESOLUTIONS.get(res_c.selected() as usize).unwrap_or(&RESOLUTIONS[1]);
-                    act(UiAction::UpdateConfig(ConfigPatch::VideoFormat(VideoFormat {
-                        width: w,
-                        height: h,
-                        fps,
-                    })));
+                    let &(w, h, _) = RESOLUTIONS
+                        .get(res_c.selected() as usize)
+                        .unwrap_or(&RESOLUTIONS[1]);
+                    act(UiAction::UpdateConfig(ConfigPatch::VideoFormat(
+                        VideoFormat {
+                            width: w,
+                            height: h,
+                            fps,
+                        },
+                    )));
                 }
             });
         }
@@ -345,7 +371,8 @@ impl ControlPanel {
         }
         audio_group.add(&loop_vol_row);
 
-        let (live_vol_row, live_vol_scale) = make_slider_row("Громкость микрофона", 0.0, 1.5, 0.05, 1.0);
+        let (live_vol_row, live_vol_scale) =
+            make_slider_row("Громкость микрофона", 0.0, 1.5, 0.05, 1.0);
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);

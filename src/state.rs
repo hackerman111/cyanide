@@ -258,9 +258,11 @@ mod tests {
 
     #[test]
     fn state_target_gains_cover_all_audio_sources() {
-        let mut cfg = Config::default();
-        cfg.loop_volume = 0.8;
-        cfg.live_volume = 1.2;
+        let cfg = Config {
+            loop_volume: 0.8,
+            live_volume: 1.2,
+            ..Default::default()
+        };
         let mut state = AppState::from_config(&cfg);
         assert_eq!(state.target_gains(&cfg), (0.0, 1.2));
         state.apply_mode_command(&Command::SetMode(StreamMode::Loop));

@@ -224,15 +224,23 @@ mod tests {
 
     #[test]
     fn config_sanitizes_bounds_and_rejects_feedback_mic() {
-        let mut cfg = Config::default();
-        cfg.av_delay_ms = 9999;
-        cfg.crossfade_ms = 2;
-        cfg.loop_volume = -1.0;
-        cfg.live_volume = 5.0;
-        cfg.compare.opacity = 3.0;
-        cfg.compare.zoom = 0.2;
-        cfg.video.fps = 0;
-        cfg.real_mic = Some("VirtualCamMic".into());
+        let cfg = Config {
+            av_delay_ms: 9999,
+            crossfade_ms: 2,
+            loop_volume: -1.0,
+            live_volume: 5.0,
+            video: VideoFormat {
+                fps: 0,
+                ..Default::default()
+            },
+            compare: CompareConfig {
+                opacity: 3.0,
+                zoom: 0.2,
+                ..Default::default()
+            },
+            real_mic: Some("VirtualCamMic".into()),
+            ..Default::default()
+        };
         let clean = cfg.sanitized();
         assert_eq!(clean.av_delay_ms, 500);
         assert_eq!(clean.crossfade_ms, 10);

@@ -182,9 +182,7 @@ impl VideoBranch {
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {
         let src = self.loop_source.as_ref()?;
         let pos = src.query_position::<gst::ClockTime>()?.mseconds();
-        let dur = src
-            .query_duration::<gst::ClockTime>()
-            .map(|d| d.mseconds());
+        let dur = src.query_duration::<gst::ClockTime>().map(|d| d.mseconds());
         Some((pos, dur))
     }
 }
@@ -199,7 +197,15 @@ fn build_loop_branch(
     force_black: bool,
     sel_pad: &gst::Pad,
     audio: &Arc<AudioBranch>,
-) -> Result<(Option<gst::Element>, gst::Element, gst::Element, Option<String>), PipelineError> {
+) -> Result<
+    (
+        Option<gst::Element>,
+        gst::Element,
+        gst::Element,
+        Option<String>,
+    ),
+    PipelineError,
+> {
     let queue = make_element("queue", Some("loop_video_queue"))?;
     let convert = make_element("videoconvert", Some("loop_convert"))?;
     let scale = make_element("videoscale", Some("loop_scale"))?;
@@ -264,13 +270,19 @@ fn build_loop_branch(
     }
 
     let (pattern, warning) = if force_black {
-        ("black", Some("Ошибка воспроизведения MP4 — показан чёрный кадр".into()))
+        (
+            "black",
+            Some("Ошибка воспроизведения MP4 — показан чёрный кадр".into()),
+        )
     } else if let Some(warn) = missing_file_warning {
         (if test_sources { "smpte" } else { "black" }, Some(warn))
     } else if test_sources {
         ("smpte", None)
     } else {
-        ("black", Some("MP4-файл не выбран — используется чёрная заглушка".into()))
+        (
+            "black",
+            Some("MP4-файл не выбран — используется чёрная заглушка".into()),
+        )
     };
 
     let fallback_src = make_element("videotestsrc", Some("loop_fallback_src"))?;
@@ -307,7 +319,10 @@ fn build_live_branch(
         let s = make_element("videotestsrc", Some("live_fallback_src"))?;
         s.set_property_from_str("pattern", "black");
         s.set_property("is-live", true);
-        (s, Some("Камера недоступна или отключена — показан чёрный кадр".into()))
+        (
+            s,
+            Some("Камера недоступна или отключена — показан чёрный кадр".into()),
+        )
     } else if test_sources {
         let s = make_element("videotestsrc", Some("live_test_src"))?;
         s.set_property_from_str("pattern", "ball");
@@ -319,7 +334,10 @@ fn build_live_branch(
         s.set_property("is-live", true);
         (
             s,
-            Some("Нет плагина v4l2src (установите gst-plugins-good) — камера заменена заглушкой".into()),
+            Some(
+                "Нет плагина v4l2src (установите gst-plugins-good) — камера заменена заглушкой"
+                    .into(),
+            ),
         )
     } else if let Some(dev) = cfg.real_camera.as_deref().filter(|p| Path::new(p).exists()) {
         let s = make_element("v4l2src", Some("live_v4l2_src"))?;
@@ -329,12 +347,19 @@ fn build_live_branch(
         let s = make_element("videotestsrc", Some("live_fallback_src"))?;
         s.set_property_from_str("pattern", "black");
         s.set_property("is-live", true);
-        (s, Some("Реальная веб-камера не выбрана или не найдена".into()))
+        (
+            s,
+            Some("Реальная веб-камера не выбрана или не найдена".into()),
+        )
     };
 
-    pipeline.add_many([&src, &queue, &convert, &scale, &rate, &caps, &tee, &sel_queue])?;
-    gst::Element::link_many([&src, &queue, &convert, &scale, &rate, &caps, &tee, &sel_queue])
-        .map_err(|e| PipelineError::Link(format!("live video chain: {e}")))?;
+    pipeline.add_many([
+        &src, &queue, &convert, &scale, &rate, &caps, &tee, &sel_queue,
+    ])?;
+    gst::Element::link_many([
+        &src, &queue, &convert, &scale, &rate, &caps, &tee, &sel_queue,
+    ])
+    .map_err(|e| PipelineError::Link(format!("live video chain: {e}")))?;
 
     let src_pad = sel_queue
         .static_pad("src")
@@ -409,11 +434,18 @@ fn build_virtual_cam_sink(
         sink.set_property("async", false);
         return Ok((
             sink,
-            Some("Нет плагина v4l2sink (установите gst-plugins-good) — работает только предпросмотр".into()),
+            Some(
+                "Нет плагина v4l2sink (установите gst-plugins-good) — работает только предпросмотр"
+                    .into(),
+            ),
         ));
     }
 
-    if let Some(dev) = cfg.virtual_camera.as_deref().filter(|p| Path::new(p).exists()) {
+    if let Some(dev) = cfg
+        .virtual_camera
+        .as_deref()
+        .filter(|p| Path::new(p).exists())
+    {
         let sink = make_element("v4l2sink", Some("virtual_cam_sink"))?;
         sink.set_property("device", dev);
         sink.set_property("sync", false);

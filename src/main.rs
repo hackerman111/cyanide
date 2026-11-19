@@ -1,0 +1,817 @@
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::rc::Rc;
+use std::time::Duration;
+
+use gstreamer as gst;
+use gtk4::{gdk, gio, glib};
+use libadwaita as adw;
+use libadwaita::prelude::*;
+
+use cyanide::config::{Config, LoopReturnPolicy};
+use cyanide::devices::{
+    self, DeviceInventory, VIRTUAL_MIC_NAME, VIRTUAL_SINK_NAME, VirtualMicGuard, modprobe_hint,
+};
+use cyanide::gui::{ConfigPatch, MainWindow, UiAction};
+use cyanide::ipc::{self, IpcRequest, IpcServerHandle};
+use cyanide::pipeline::{self, ForceFallback, MediaPipeline, PipelineEvent, PreviewBackend};
+use cyanide::state::{AppState, Command, Reply, VideoSource};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliAction {
+    Run {
+        background: bool,
+        test_sources: bool,
+    },
+    Ctl(Command),
+    Doctor,
+    Help,
+}
+
+fn parse_cli<I, S>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let items: Vec<String> = args
+        .into_iter()
+        .skip(1)
+        .map(|s| s.as_ref().to_string())
+        .collect();
+    if items.is_empty() {
+        return Ok(CliAction::Run {
+            background: false,
+            test_sources: false,
+        });
+    }
+
+    match items[0].as_str() {
+        "-h" | "--help" | "help" => Ok(CliAction::Help),
+        "doctor" => Ok(CliAction::Doctor),
+        "ctl" => {
+            if items.len() < 2 {
+                return Err("missing ctl subcommand (try: toggle, mode, video, audio, mic, show, hide, status, quit)".into());
+            }
+            let joined = items[1..].join(" ");
+            let cmd = ipc::parse_command_line(&joined)?;
+            Ok(CliAction::Ctl(cmd))
+        }
+        _ => {
+            let mut background = false;
+            let mut test_sources = false;
+            for flag in &items {
+                match flag.as_str() {
+                    "--background" | "-b" => background = true,
+                    "--test-sources" => test_sources = true,
+                    other => return Err(format!("unknown option '{other}'")),
+                }
+            }
+            Ok(CliAction::Run {
+                background,
+                test_sources,
+            })
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "\
+cyanide — Virtual camera (v4l2loopback) & virtual mic (PipeWire) studio
+
+USAGE:
+  cyanide [--background] [--test-sources]
+  cyanide ctl <toggle|mode <loop|live>|video <loop|live>|audio <file|mic|mix|silence>|mic <on|off|toggle>|show|hide|status|quit>
+  cyanide doctor"
+    );
+}
+
+fn run_ctl(cmd: &Command) -> ExitCode {
+    let sock = ipc::default_socket_path();
+    match ipc::send_command(&sock, cmd) {
+        Ok(reply) => {
+            if let Ok(json) = serde_json::to_string(&reply) {
+                println!("{json}");
+            }
+            match reply {
+                Reply::Error { .. } => ExitCode::FAILURE,
+                Reply::Ok { .. } | Reply::Status(_) => ExitCode::SUCCESS,
+            }
+        }
+        Err(err) => {
+            eprintln!("error: {err} (socket: {})", sock.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_doctor() -> ExitCode {
+    if let Err(err) = gst::init() {
+        eprintln!("GStreamer init failed: {err}");
+        return ExitCode::FAILURE;
+    }
+    let _ = gstgtk4::plugin_register_static();
+
+    println!("=== GStreamer plugins ===");
+    let mut missing_good = false;
+    for (name, present) in pipeline::check_runtime_plugins() {
+        println!("  {name:<20} {}", if present { "OK" } else { "MISSING" });
+        if !present
+            && matches!(
+                name,
+                "v4l2src" | "v4l2sink" | "pulsesrc" | "pulsesink" | "level"
+            )
+        {
+            missing_good = true;
+        }
+    }
+
+    println!("\n=== V4L2 devices ===");
+    let inv = devices::discover_all();
+    if inv.real_cameras.is_empty() {
+        println!("  real cameras:     none");
+    } else {
+        for cam in &inv.real_cameras {
+            println!("  real camera:      {} ({})", cam.path, cam.name);
+        }
+    }
+    if inv.loopback_cameras.is_empty() {
+        println!("  v4l2loopback:     MISSING");
+        println!("    hint: {}", modprobe_hint());
+    } else {
+        for cam in &inv.loopback_cameras {
+            println!("  v4l2loopback:     {} ({})", cam.path, cam.name);
+        }
+    }
+
+    println!("\n=== PipeWire / pactl ===");
+    if devices::pipewire::pactl_available() {
+        println!(
+            "  pactl:            OK (will register {VIRTUAL_SINK_NAME} -> {VIRTUAL_MIC_NAME})"
+        );
+        println!("  real mics found:  {}", inv.real_mics.len());
+    } else {
+        println!("  pactl:            UNAVAILABLE");
+    }
+
+    if missing_good {
+        println!("\nArch Linux hint:");
+        println!("  sudo pacman -S gst-plugins-good gst-libav v4l2loopback-dkms");
+    }
+    ExitCode::SUCCESS
+}
+
+struct AppController {
+    app: adw::Application,
+    hold: Option<gio::ApplicationHoldGuard>,
+    config_path: PathBuf,
+    config: Config,
+    state: AppState,
+    devices: DeviceInventory,
+    test_sources: bool,
+    fallback: ForceFallback,
+    virtual_mic: Option<VirtualMicGuard>,
+    mic_init_warning: Option<String>,
+    pipeline: Option<MediaPipeline>,
+    ipc_server: Option<IpcServerHandle>,
+    window: Option<MainWindow>,
+    save_timer: Option<glib::SourceId>,
+    timecode_timer: Option<glib::SourceId>,
+    shutting_down: bool,
+}
+
+impl AppController {
+    fn hydrate_default_devices(&mut self) {
+        if self.config.real_camera.is_none()
+            && let Some(first) = self.devices.real_cameras.first()
+        {
+            self.config.real_camera = Some(first.path.clone());
+        }
+        if self.config.virtual_camera.is_none()
+            && let Some(first) = self.devices.loopback_cameras.first()
+        {
+            self.config.virtual_camera = Some(first.path.clone());
+        }
+        if self.config.real_mic.is_none()
+            && let Some(first) = self.devices.real_mics.first()
+        {
+            self.config.real_mic = Some(first.name.clone());
+        }
+    }
+
+    fn refresh_health(&mut self) {
+        let mut health = self
+            .pipeline
+            .as_ref()
+            .map(MediaPipeline::health)
+            .unwrap_or_default();
+        if let Some(ref w) = self.mic_init_warning {
+            health.output_warning = Some(match health.output_warning.take() {
+                Some(prev) => format!("{prev}; {w}"),
+                None => w.clone(),
+            });
+        }
+        self.state.health = health;
+    }
+
+    fn sync_window(&self) {
+        if let Some(ref win) = self.window {
+            win.sync_state(&self.config, &self.state, &self.devices);
+        }
+    }
+
+    fn bind_pipeline_paintables(&self) {
+        let (Some(win), Some(pipe)) = (self.window.as_ref(), self.pipeline.as_ref()) else {
+            return;
+        };
+        let previews = pipe.preview_objects();
+        let loop_p = previews.loop_sink.property::<gdk::Paintable>("paintable");
+        let live_p = previews.live_sink.property::<gdk::Paintable>("paintable");
+        let out_p = previews.out_sink.property::<gdk::Paintable>("paintable");
+        win.bind_paintables(Some(loop_p), Some(live_p), Some(out_p));
+    }
+}
+
+fn rebuild_pipeline(ctrl: &Rc<RefCell<AppController>>) {
+    let weak = Rc::downgrade(ctrl);
+    let (cfg, state, test_sources, fallback, visible) = {
+        let mut c = ctrl.borrow_mut();
+        if let Some(mut old) = c.pipeline.take() {
+            old.stop();
+        }
+        let visible = c.window.as_ref().is_some_and(MainWindow::is_visible);
+        (
+            c.config.clone(),
+            c.state.clone(),
+            c.test_sources,
+            c.fallback,
+            visible,
+        )
+    };
+
+    let on_event = move |event: PipelineEvent| {
+        let weak_cb = weak.clone();
+        glib::idle_add_local_once(move || {
+            let Some(ctrl_rc) = weak_cb.upgrade() else {
+                return;
+            };
+            handle_pipeline_event(&ctrl_rc, event);
+        });
+    };
+
+    match MediaPipeline::start_with_fallback(
+        &cfg,
+        &state,
+        PreviewBackend::Gtk4,
+        test_sources,
+        fallback,
+        on_event,
+    ) {
+        Ok(pipe) => {
+            pipe.set_previews_active(visible);
+            let mut c = ctrl.borrow_mut();
+            c.pipeline = Some(pipe);
+            c.refresh_health();
+            c.bind_pipeline_paintables();
+            c.sync_window();
+        }
+        Err(err) => {
+            let mut c = ctrl.borrow_mut();
+            c.state.health.output_warning = Some(format!("Ошибка запуска пайплайна: {err}"));
+            c.sync_window();
+            eprintln!("pipeline start failed: {err}");
+        }
+    }
+}
+
+fn handle_pipeline_event(ctrl: &Rc<RefCell<AppController>>, event: PipelineEvent) {
+    match event {
+        PipelineEvent::Levels(levels) => {
+            let mut c = ctrl.borrow_mut();
+            c.state.levels = levels;
+            if let Some(ref win) = c.window
+                && win.is_visible()
+            {
+                win.update_levels(&levels);
+            }
+        }
+        PipelineEvent::Position { pos_ms, dur_ms } => {
+            let mut c = ctrl.borrow_mut();
+            c.state.loop_pos_ms = pos_ms;
+            c.state.loop_dur_ms = dur_ms;
+        }
+        PipelineEvent::Degraded { branch, reason } => {
+            // Privacy invariant: NEVER alter `state.mode` (never auto-switch Loop -> Live).
+            let should_rebuild = {
+                let mut c = ctrl.borrow_mut();
+                match branch {
+                    VideoSource::Loop if !c.fallback.loop_black => {
+                        c.fallback.loop_black = true;
+                        eprintln!("loop branch degraded ({reason}); falling back to black");
+                        true
+                    }
+                    VideoSource::Live if !c.fallback.live_black => {
+                        c.fallback.live_black = true;
+                        eprintln!("live branch degraded ({reason}); falling back to black");
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if should_rebuild {
+                rebuild_pipeline(ctrl);
+            }
+        }
+        PipelineEvent::FatalError(reason) => {
+            let mut c = ctrl.borrow_mut();
+            c.state.health.output_warning = Some(format!("Ошибка GStreamer: {reason}"));
+            c.sync_window();
+            eprintln!("pipeline fatal error: {reason}");
+        }
+    }
+}
+
+fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
+    if ctrl.borrow().window.is_some() {
+        return;
+    }
+
+    let app = ctrl.borrow().app.clone();
+    let weak_act = Rc::downgrade(ctrl);
+    let on_action: Rc<dyn Fn(UiAction)> = Rc::new(move |action| {
+        let weak_cb = weak_act.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(c) = weak_cb.upgrade() {
+                handle_ui_action(&c, action);
+            }
+        });
+    });
+
+    let weak_vis = Rc::downgrade(ctrl);
+    let on_visibility: Rc<dyn Fn(bool)> = Rc::new(move |visible| {
+        let weak_cb = weak_vis.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(c) = weak_cb.upgrade()
+                && let Some(ref pipe) = c.borrow().pipeline
+            {
+                pipe.set_previews_active(visible);
+            }
+        });
+    });
+
+    let win = MainWindow::new(&app, on_action, on_visibility);
+    {
+        let mut c = ctrl.borrow_mut();
+        c.window = Some(win);
+        c.bind_pipeline_paintables();
+        c.sync_window();
+    }
+}
+
+fn show_window(ctrl: &Rc<RefCell<AppController>>) {
+    ensure_window(ctrl);
+    // Present outside any RefCell borrow to avoid re-entrant signal borrows.
+    if let Some(ref win) = ctrl.borrow().window {
+        win.present();
+    }
+}
+
+fn hide_window(ctrl: &Rc<RefCell<AppController>>) {
+    if let Some(ref win) = ctrl.borrow().window {
+        win.hide();
+    }
+}
+
+fn apply_command(ctrl: &Rc<RefCell<AppController>>, cmd: Command) -> Reply {
+    match cmd {
+        Command::Show => {
+            show_window(ctrl);
+            Reply::Ok {
+                message: "window shown".into(),
+            }
+        }
+        Command::Hide => {
+            hide_window(ctrl);
+            Reply::Ok {
+                message: "window hidden".into(),
+            }
+        }
+        Command::Status => {
+            let c = ctrl.borrow();
+            Reply::Status(c.state.snapshot(&c.config))
+        }
+        Command::Quit => {
+            let weak = Rc::downgrade(ctrl);
+            glib::idle_add_local_once(move || {
+                if let Some(c) = weak.upgrade() {
+                    shutdown_controller(&c);
+                }
+            });
+            Reply::Ok {
+                message: "shutting down".into(),
+            }
+        }
+        mode_cmd => {
+            // Runtime mode/mic/freeze commands NEVER overwrite startup_mode in config.toml.
+            let mut c = ctrl.borrow_mut();
+            let effect = c.state.apply_mode_command(&mode_cmd);
+            let target = c.state.target_gains(&c.config);
+            let crossfade_ms = c.config.crossfade_ms;
+            let return_policy = c.config.loop_return;
+            let video_src = c.state.mode.video();
+
+            if let Some(ref mut pipe) = c.pipeline {
+                if effect.video_changed {
+                    pipe.select_video(video_src, return_policy, effect.video_switched_to_loop);
+                }
+                if effect.audio_changed {
+                    pipe.start_audio_ramp(target, crossfade_ms);
+                }
+            }
+            c.sync_window();
+            Reply::Status(c.state.snapshot(&c.config))
+        }
+    }
+}
+
+fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
+    match action {
+        UiAction::Command(cmd) => {
+            let _ = apply_command(ctrl, cmd);
+        }
+        UiAction::PickLoopFile(path) => {
+            {
+                let mut c = ctrl.borrow_mut();
+                c.config.loop_file = Some(path);
+                c.fallback.loop_black = false;
+            }
+            schedule_config_save(ctrl);
+            rebuild_pipeline(ctrl);
+        }
+        UiAction::RefreshDevices => {
+            let mut c = ctrl.borrow_mut();
+            c.devices = devices::discover_all();
+            c.hydrate_default_devices();
+            c.sync_window();
+        }
+        UiAction::SetReturnBookmarkCurrent => {
+            {
+                let mut c = ctrl.borrow_mut();
+                let pos = c
+                    .pipeline
+                    .as_ref()
+                    .and_then(MediaPipeline::loop_position_ms)
+                    .map(|(p, _)| p)
+                    .unwrap_or(c.state.loop_pos_ms);
+                c.config.loop_return = LoopReturnPolicy::Bookmark { position_ms: pos };
+                c.sync_window();
+            }
+            schedule_config_save(ctrl);
+        }
+        UiAction::UpdateConfig(patch) => {
+            let mut needs_rebuild = false;
+            let mut audio_gain_changed = false;
+            let mut av_delay_changed = false;
+
+            {
+                let mut c = ctrl.borrow_mut();
+                match patch {
+                    ConfigPatch::StartupMode(m) => c.config.startup_mode = m,
+                    ConfigPatch::RealCamera(cam) => {
+                        if c.config.real_camera != cam {
+                            c.config.real_camera = cam;
+                            c.fallback.live_black = false;
+                            needs_rebuild = true;
+                        }
+                    }
+                    ConfigPatch::VirtualCamera(cam) => {
+                        if c.config.virtual_camera != cam {
+                            c.config.virtual_camera = cam;
+                            needs_rebuild = true;
+                        }
+                    }
+                    ConfigPatch::RealMic(mic) => {
+                        if c.config.real_mic != mic {
+                            c.config.real_mic = mic;
+                            needs_rebuild = true;
+                        }
+                    }
+                    ConfigPatch::VideoFormat(fmt) => {
+                        if c.config.video != fmt {
+                            c.config.video = fmt;
+                            needs_rebuild = true;
+                        }
+                    }
+                    ConfigPatch::LoopVolume(v) => {
+                        c.config.loop_volume = v;
+                        audio_gain_changed = true;
+                    }
+                    ConfigPatch::LiveVolume(v) => {
+                        c.config.live_volume = v;
+                        audio_gain_changed = true;
+                    }
+                    ConfigPatch::AvDelayMs(ms) => {
+                        c.config.av_delay_ms = ms;
+                        av_delay_changed = true;
+                    }
+                    ConfigPatch::CrossfadeMs(ms) => {
+                        c.config.crossfade_ms = ms;
+                    }
+                    ConfigPatch::LoopReturn(policy) => {
+                        c.config.loop_return = match (policy, c.config.loop_return) {
+                            (
+                                LoopReturnPolicy::Bookmark { position_ms: 0 },
+                                LoopReturnPolicy::Bookmark { position_ms },
+                            ) => LoopReturnPolicy::Bookmark { position_ms },
+                            (new_policy, _) => new_policy,
+                        };
+                    }
+                    ConfigPatch::Compare(cmp) => {
+                        c.config.compare = cmp;
+                    }
+                }
+                c.config = c.config.clone().sanitized();
+
+                if audio_gain_changed {
+                    let target = c.state.target_gains(&c.config);
+                    let cf = c.config.crossfade_ms;
+                    if let Some(ref mut pipe) = c.pipeline {
+                        pipe.start_audio_ramp(target, cf);
+                    }
+                }
+                if av_delay_changed && let Some(ref pipe) = c.pipeline {
+                    pipe.set_av_delay_ms(c.config.av_delay_ms);
+                }
+                c.sync_window();
+            }
+
+            schedule_config_save(ctrl);
+            if needs_rebuild {
+                rebuild_pipeline(ctrl);
+            }
+        }
+    }
+}
+
+fn schedule_config_save(ctrl: &Rc<RefCell<AppController>>) {
+    let mut c = ctrl.borrow_mut();
+    if let Some(id) = c.save_timer.take() {
+        id.remove();
+    }
+    let weak = Rc::downgrade(ctrl);
+    c.save_timer = Some(glib::timeout_add_local_once(
+        Duration::from_millis(300),
+        move || {
+            let Some(ctrl_rc) = weak.upgrade() else {
+                return;
+            };
+            let mut inner = ctrl_rc.borrow_mut();
+            inner.save_timer = None;
+            if let Err(err) = inner.config.save(&inner.config_path) {
+                eprintln!("failed to save config: {err}");
+            }
+        },
+    ));
+}
+
+fn shutdown_controller(ctrl: &Rc<RefCell<AppController>>) {
+    let app = {
+        let mut c = ctrl.borrow_mut();
+        if c.shutting_down {
+            return;
+        }
+        c.shutting_down = true;
+        if let Some(id) = c.save_timer.take() {
+            id.remove();
+            let _ = c.config.save(&c.config_path);
+        }
+        if let Some(id) = c.timecode_timer.take() {
+            id.remove();
+        }
+        if let Some(mut pipe) = c.pipeline.take() {
+            pipe.stop();
+        }
+        c.virtual_mic.take();
+        if let Some(server) = c.ipc_server.take() {
+            server.shutdown();
+        }
+        c.window.take();
+        c.hold.take();
+        c.app.clone()
+    };
+    app.quit();
+}
+
+fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
+    let sock_path = ipc::default_socket_path();
+    if !background && let Ok(Reply::Ok { .. }) = ipc::send_command(&sock_path, &Command::Show) {
+        return ExitCode::SUCCESS;
+    }
+
+    if let Err(err) = gst::init() {
+        eprintln!("GStreamer init failed: {err}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(err) = gstgtk4::plugin_register_static() {
+        eprintln!("gst-plugin-gtk4 registration failed: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let config_path = Config::default_path();
+    let config = match Config::load_or_default(&config_path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("error loading {}: {err}", config_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (ipc_tx, ipc_rx) = async_channel::bounded::<IpcRequest>(32);
+    let ipc_server = match IpcServerHandle::start_with_signals(sock_path, ipc_tx) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("IPC server failed to start: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (virtual_mic, mic_init_warning) = if test_sources {
+        (None, None)
+    } else {
+        match VirtualMicGuard::create(&devices::default_pw_state_file()) {
+            Ok(guard) => (Some(guard), None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "Не удалось создать виртуальный микрофон PipeWire: {err}"
+                )),
+            ),
+        }
+    };
+
+    let app = adw::Application::builder()
+        .application_id("io.github.cyanide.VirtualCam")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+
+    let startup_bundle = RefCell::new(Some((
+        config_path,
+        config,
+        virtual_mic,
+        mic_init_warning,
+        ipc_server,
+        ipc_rx,
+    )));
+    let controller_slot: Rc<RefCell<Option<Rc<RefCell<AppController>>>>> =
+        Rc::new(RefCell::new(None));
+
+    let slot_activate = Rc::clone(&controller_slot);
+    app.connect_activate(move |app| {
+        if let Some(existing) = slot_activate.borrow().as_ref() {
+            if !background {
+                show_window(existing);
+            }
+            return;
+        }
+
+        let Some((config_path, config, virtual_mic, mic_init_warning, ipc_server, ipc_rx)) =
+            startup_bundle.borrow_mut().take()
+        else {
+            return;
+        };
+
+        let hold = app.hold();
+        let state = AppState::from_config(&config);
+        let devices = devices::discover_all();
+        let mut ctrl_inner = AppController {
+            app: app.clone(),
+            hold: Some(hold),
+            config_path,
+            config,
+            state,
+            devices,
+            test_sources,
+            fallback: ForceFallback::default(),
+            virtual_mic,
+            mic_init_warning,
+            pipeline: None,
+            ipc_server: Some(ipc_server),
+            window: None,
+            save_timer: None,
+            timecode_timer: None,
+            shutting_down: false,
+        };
+        ctrl_inner.hydrate_default_devices();
+
+        let ctrl = Rc::new(RefCell::new(ctrl_inner));
+        *slot_activate.borrow_mut() = Some(Rc::clone(&ctrl));
+
+        rebuild_pipeline(&ctrl);
+
+        // Drain IPC commands on GLib main thread (single-threaded state ownership).
+        let ctrl_ipc = Rc::clone(&ctrl);
+        glib::spawn_future_local(async move {
+            while let Ok(req) = ipc_rx.recv().await {
+                let reply = apply_command(&ctrl_ipc, req.command);
+                let _ = req.reply.send(reply);
+            }
+        });
+
+        // Poll MP4 playback timecode at 250ms only while GUI is visible.
+        let weak_tc = Rc::downgrade(&ctrl);
+        let tc_id = glib::timeout_add_local(Duration::from_millis(250), move || {
+            let Some(ctrl_rc) = weak_tc.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let mut c = ctrl_rc.borrow_mut();
+            let visible = c.window.as_ref().is_some_and(MainWindow::is_visible);
+            if !visible {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some((pos_ms, dur_ms)) = c
+                .pipeline
+                .as_ref()
+                .and_then(MediaPipeline::loop_position_ms)
+            {
+                c.state.loop_pos_ms = pos_ms;
+                c.state.loop_dur_ms = dur_ms;
+            }
+            let fname = c
+                .config
+                .loop_file
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Нет MP4".into());
+            let pos = c.state.loop_pos_ms;
+            let dur = c.state.loop_dur_ms;
+            let fps = c.config.video.fps;
+            if let Some(ref win) = c.window {
+                win.update_timecode(&fname, pos, dur, fps);
+            }
+            glib::ControlFlow::Continue
+        });
+        ctrl.borrow_mut().timecode_timer = Some(tc_id);
+
+        if !background {
+            show_window(&ctrl);
+        }
+    });
+
+    let code = app.run_with_args::<&str>(&[]);
+    if let Some(ctrl) = controller_slot.borrow().as_ref() {
+        shutdown_controller(ctrl);
+    }
+    if code == glib::ExitCode::SUCCESS {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn main() -> ExitCode {
+    match parse_cli(std::env::args()) {
+        Ok(CliAction::Help) => {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        Ok(CliAction::Doctor) => run_doctor(),
+        Ok(CliAction::Ctl(cmd)) => run_ctl(&cmd),
+        Ok(CliAction::Run {
+            background,
+            test_sources,
+        }) => run_daemon(background, test_sources),
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            print_help();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cyanide::state::AudioSource;
+
+    #[test]
+    fn cli_parses_run_flags_ctl_and_doctor() {
+        assert_eq!(
+            parse_cli(["cyanide", "--background", "--test-sources"]).unwrap(),
+            CliAction::Run {
+                background: true,
+                test_sources: true,
+            }
+        );
+        assert_eq!(
+            parse_cli(["cyanide", "ctl", "toggle"]).unwrap(),
+            CliAction::Ctl(Command::Toggle)
+        );
+        assert_eq!(
+            parse_cli(["cyanide", "ctl", "audio", "silence"]).unwrap(),
+            CliAction::Ctl(Command::SetAudio(AudioSource::Silence))
+        );
+        assert_eq!(parse_cli(["cyanide", "doctor"]).unwrap(), CliAction::Doctor);
+    }
+}

@@ -2,14 +2,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{oneshot, watch};
 
 use crate::state::{AudioSource, Command, MicAction, Reply, StreamMode, VideoSource};
 
@@ -34,7 +33,7 @@ pub struct IpcRequest {
 
 pub struct IpcServerHandle {
     socket_path: PathBuf,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +41,21 @@ impl IpcServerHandle {
     pub fn start(
         socket_path: PathBuf,
         tx: async_channel::Sender<IpcRequest>,
+    ) -> Result<Self, IpcError> {
+        Self::start_inner(socket_path, tx, false)
+    }
+
+    pub fn start_with_signals(
+        socket_path: PathBuf,
+        tx: async_channel::Sender<IpcRequest>,
+    ) -> Result<Self, IpcError> {
+        Self::start_inner(socket_path, tx, true)
+    }
+
+    fn start_inner(
+        socket_path: PathBuf,
+        tx: async_channel::Sender<IpcRequest>,
+        watch_signals: bool,
     ) -> Result<Self, IpcError> {
         if socket_path.exists() {
             if StdUnixStream::connect(&socket_path).is_ok() {
@@ -57,8 +71,7 @@ impl IpcServerHandle {
         let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
         std_listener.set_nonblocking(true)?;
 
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_rx = Arc::clone(&shutdown);
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let thread = std::thread::Builder::new()
             .name("cyanide-ipc".into())
             .spawn(move || {
@@ -73,8 +86,12 @@ impl IpcServerHandle {
                     let Ok(listener) = UnixListener::from_std(std_listener) else {
                         return;
                     };
+                    if watch_signals {
+                        spawn_unix_signal_forwarder(tx.clone(), shutdown_rx.clone());
+                    }
                     serve_loop(listener, tx, shutdown_rx).await;
                 });
+                rt.shutdown_timeout(Duration::from_millis(500));
             })
             .map_err(|e| IpcError::Runtime(e.to_string()))?;
 
@@ -90,7 +107,7 @@ impl IpcServerHandle {
     }
 
     fn stop_inner(&mut self) {
-        self.shutdown.notify_one();
+        let _ = self.shutdown.send(true);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -167,14 +184,42 @@ pub fn send_command(socket_path: &Path, command: &Command) -> Result<Reply, IpcE
     Ok(reply)
 }
 
+fn spawn_unix_signal_forwarder(
+    tx: async_channel::Sender<IpcRequest>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+            return;
+        };
+        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        tokio::select! {
+            _ = shutdown.wait_for(|&stop| stop) => return,
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+        }
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = tx
+            .send(IpcRequest {
+                command: Command::Quit,
+                reply: reply_tx,
+            })
+            .await;
+    });
+}
+
 async fn serve_loop(
     listener: UnixListener,
     tx: async_channel::Sender<IpcRequest>,
-    shutdown: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
-            _ = shutdown.notified() => break,
+            _ = shutdown.wait_for(|&stop| stop) => break,
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else {
                     break;
@@ -199,7 +244,14 @@ async fn handle_client(stream: tokio::net::UnixStream, tx: async_channel::Sender
     let reply = match parse_command_line(&line) {
         Ok(command) => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if tx.send(IpcRequest { command, reply: reply_tx }).await.is_err() {
+            if tx
+                .send(IpcRequest {
+                    command,
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
                 Reply::Error {
                     message: "daemon is shutting down".into(),
                 }

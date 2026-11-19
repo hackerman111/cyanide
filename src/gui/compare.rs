@@ -8,7 +8,9 @@ use gtk4::subclass::prelude::*;
 
 use crate::config::{CompareConfig, CompareMode};
 
-pub fn fit_aspect_rect(bounds: (f32, f32), aspect: f32) -> (f32, f32, f32, f32) {
+pub type Rect4 = (f32, f32, f32, f32);
+
+pub fn fit_aspect_rect(bounds: (f32, f32), aspect: f32) -> Rect4 {
     let (bw, bh) = bounds;
     if bw <= 0.0 || bh <= 0.0 {
         return (0.0, 0.0, 0.0, 0.0);
@@ -30,18 +32,14 @@ pub fn fit_aspect_rect(bounds: (f32, f32), aspect: f32) -> (f32, f32, f32, f32) 
     }
 }
 
-pub fn split_clip_rects(
-    w: f32,
-    h: f32,
-    ratio: f32,
-) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+pub fn split_clip_rects(w: f32, h: f32, ratio: f32) -> (Rect4, Rect4) {
     let clamped = ratio.clamp(0.05, 0.95);
     let split_x = w * clamped;
     ((0.0, 0.0, split_x, h), (split_x, 0.0, w - split_x, h))
 }
 
 /// Returns `(x, y, width, height)` 1px line rectangles for active grid, center axis, and custom guides.
-pub fn grid_segments(w: f32, h: f32, cfg: &CompareConfig) -> Vec<(f32, f32, f32, f32)> {
+pub fn grid_segments(w: f32, h: f32, cfg: &CompareConfig) -> Vec<Rect4> {
     let mut segs = Vec::with_capacity(8);
     if w <= 0.0 || h <= 0.0 {
         return segs;
@@ -239,11 +237,7 @@ impl CompareView {
         glib::Object::builder().build()
     }
 
-    pub fn set_paintables(
-        &self,
-        loop_p: Option<gdk::Paintable>,
-        live_p: Option<gdk::Paintable>,
-    ) {
+    pub fn set_paintables(&self, loop_p: Option<gdk::Paintable>, live_p: Option<gdk::Paintable>) {
         self.rebind_slot(&self.imp().loop_bound, loop_p);
         self.rebind_slot(&self.imp().live_bound, live_p);
         self.queue_draw();
@@ -395,12 +389,14 @@ mod tests {
 
     #[test]
     fn grid_segments_reflect_toggles() {
-        let mut cfg = CompareConfig::default();
-        cfg.show_grid = true;
-        cfg.show_center = true;
-        cfg.show_guides = true;
-        cfg.guide_x = 0.25;
-        cfg.guide_y = 0.75;
+        let cfg = CompareConfig {
+            show_grid: true,
+            show_center: true,
+            show_guides: true,
+            guide_x: 0.25,
+            guide_y: 0.75,
+            ..Default::default()
+        };
         let segs = grid_segments(900.0, 600.0, &cfg);
         // 4 lines for 3x3 + 2 for center + 2 for custom guides = 8 segments
         assert_eq!(segs.len(), 8);

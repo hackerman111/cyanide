@@ -227,10 +227,8 @@ impl AudioBranch {
     }
 
     pub fn set_gains(&self, loop_gain: f64, live_gain: f64) {
-        self.loop_vol
-            .set_property("volume", clamp_gain(loop_gain));
-        self.live_vol
-            .set_property("volume", clamp_gain(live_gain));
+        self.loop_vol.set_property("volume", clamp_gain(loop_gain));
+        self.live_vol.set_property("volume", clamp_gain(live_gain));
     }
 
     pub fn current_gains(&self) -> (f64, f64) {
@@ -314,7 +312,9 @@ fn build_audio_sink(test_sources: bool) -> Result<(gst::Element, Option<String>)
         sink.set_property("sync", false);
         return Ok((
             sink,
-            Some("Нет плагина pulsesink (установите gst-plugins-good) — вывод звука отключён".into()),
+            Some(
+                "Нет плагина pulsesink (установите gst-plugins-good) — вывод звука отключён".into(),
+            ),
         ));
     }
 

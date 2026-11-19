@@ -62,7 +62,7 @@ pub struct MediaPipeline {
     video: Rc<VideoBranch>,
     audio: Arc<AudioBranch>,
     bus_watch: Option<BusWatchGuard>,
-    ramp_source: Option<glib::SourceId>,
+    ramp_source: Rc<RefCell<Option<glib::SourceId>>>,
     ramp_state: Rc<RefCell<Option<GainRamp>>>,
     stopped: bool,
 }
@@ -120,7 +120,7 @@ impl MediaPipeline {
             video,
             audio,
             bus_watch,
-            ramp_source: None,
+            ramp_source: Rc::new(RefCell::new(None)),
             ramp_state: Rc::new(RefCell::new(None)),
             stopped: false,
         })
@@ -154,7 +154,7 @@ impl MediaPipeline {
         let duration = crossfade_ms.clamp(10, 30);
         if let Some(existing) = self.ramp_state.borrow_mut().as_mut() {
             existing.retarget(target, duration);
-            if self.ramp_source.is_some() {
+            if self.ramp_source.borrow().is_some() {
                 return;
             }
         } else {
@@ -162,27 +162,30 @@ impl MediaPipeline {
             *self.ramp_state.borrow_mut() = Some(GainRamp::new(start, target, duration, 5));
         }
 
-        if let Some(id) = self.ramp_source.take() {
+        if let Some(id) = self.ramp_source.borrow_mut().take() {
             id.remove();
         }
 
         let audio = Arc::clone(&self.audio);
         let ramp_state = Rc::clone(&self.ramp_state);
+        let ramp_source = Rc::clone(&self.ramp_source);
         let id = glib::timeout_add_local(Duration::from_millis(5), move || {
             let mut slot = ramp_state.borrow_mut();
             let Some(ramp) = slot.as_mut() else {
+                *ramp_source.borrow_mut() = None;
                 return glib::ControlFlow::Break;
             };
             let ((lg, rg), done) = ramp.step();
             audio.set_gains(lg, rg);
             if done {
                 *slot = None;
+                *ramp_source.borrow_mut() = None;
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
             }
         });
-        self.ramp_source = Some(id);
+        *self.ramp_source.borrow_mut() = Some(id);
     }
 
     pub fn set_av_delay_ms(&self, av_delay_ms: i32) {
@@ -220,7 +223,7 @@ impl MediaPipeline {
             return;
         }
         self.stopped = true;
-        if let Some(id) = self.ramp_source.take() {
+        if let Some(id) = self.ramp_source.borrow_mut().take() {
             id.remove();
         }
         *self.ramp_state.borrow_mut() = None;
@@ -329,7 +332,9 @@ fn attach_bus_watch(
 fn classify_error_branch(src_path: &str) -> Option<VideoSource> {
     if src_path.contains("loop_") || src_path.contains("uridecodebin") {
         Some(VideoSource::Loop)
-    } else if src_path.contains("live_") || src_path.contains("v4l2src") || src_path.contains("pulsesrc")
+    } else if src_path.contains("live_")
+        || src_path.contains("v4l2src")
+        || src_path.contains("pulsesrc")
     {
         Some(VideoSource::Live)
     } else {
@@ -393,9 +398,11 @@ mod tests {
         gst::init().unwrap();
         let ctx = glib::MainContext::new();
         ctx.with_thread_default(|| {
-            let mut cfg = Config::default();
-            cfg.startup_mode = StartupMode::Loop;
-            cfg.loop_file = Some(PathBuf::from("/nonexistent/missing-loop-file.mp4"));
+            let cfg = Config {
+                startup_mode: StartupMode::Loop,
+                loop_file: Some(PathBuf::from("/nonexistent/missing-loop-file.mp4")),
+                ..Default::default()
+            };
             let state = AppState::from_config(&cfg);
             let mut pipe =
                 MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
