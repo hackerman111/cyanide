@@ -1,0 +1,34 @@
+# Cyanide VirtualCam configuration (~/.config/cyanide/config.toml)
+
+startup_mode = "live"
+# loop_file = "/path/to/loop.mp4"
+# real_camera = "/dev/video0"
+# virtual_camera = "/dev/video10"
+# real_mic = "alsa_input.pci-0000_00_1f.3.analog-stereo"
+
+loop_volume = 1.0
+live_volume = 1.0
+av_delay_ms = 0
+crossfade_ms = 20
+
+[video]
+width = 1280
+height = 720
+fps = 30
+
+[loop_return]
+policy = "continue"
+
+[compare]
+mode = "overlay"
+opacity = 0.5
+split_pos = 0.5
+show_grid = false
+show_center = false
+show_guides = false
+guide_x = 0.5
+guide_y = 0.5
+mirror = false
+zoom = 1.0
+pan_x = 0.0
+pan_y = 0.0
