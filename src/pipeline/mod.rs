@@ -357,47 +357,55 @@ mod tests {
     #[test]
     fn pipeline_starts_switches_modes_and_applies_av_delay() {
         gst::init().unwrap();
-        let cfg = Config::default();
-        let mut state = AppState::from_config(&cfg);
-        let mut pipe =
-            MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let cfg = Config::default();
+            let mut state = AppState::from_config(&cfg);
+            let mut pipe =
+                MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
 
-        let (res, gst_state, _) = pipe.pipeline.state(gst::ClockTime::from_seconds(2));
-        assert!(res.is_ok() && gst_state == gst::State::Playing);
+            let (res, gst_state, _) = pipe.pipeline.state(gst::ClockTime::from_seconds(2));
+            assert!(res.is_ok() && gst_state == gst::State::Playing);
 
-        pipe.set_previews_active(true);
-        pipe.set_av_delay_ms(120);
-        pipe.set_av_delay_ms(-80);
-        state.apply_mode_command(&Command::Toggle);
-        pipe.select_video(state.mode.video(), cfg.loop_return, true);
+            pipe.set_previews_active(true);
+            pipe.set_av_delay_ms(120);
+            pipe.set_av_delay_ms(-80);
+            state.apply_mode_command(&Command::Toggle);
+            pipe.select_video(state.mode.video(), cfg.loop_return, true);
 
-        // input-selector commits pending active-pad on the next incoming frame (~33ms at 30fps).
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while pipe.active_video_source() != VideoSource::Loop
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(pipe.active_video_source(), VideoSource::Loop);
+            // input-selector commits pending active-pad on the next incoming frame (~33ms at 30fps).
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while pipe.active_video_source() != VideoSource::Loop
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(pipe.active_video_source(), VideoSource::Loop);
 
-        pipe.set_previews_active(false);
-        pipe.stop();
+            pipe.set_previews_active(false);
+            pipe.stop();
+        })
+        .unwrap();
     }
 
     #[test]
     fn pipeline_loop_degradation_never_switches_to_live() {
         gst::init().unwrap();
-        let mut cfg = Config::default();
-        cfg.startup_mode = StartupMode::Loop;
-        cfg.loop_file = Some(PathBuf::from("/nonexistent/missing-loop-file.mp4"));
-        let state = AppState::from_config(&cfg);
-        let mut pipe =
-            MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let mut cfg = Config::default();
+            cfg.startup_mode = StartupMode::Loop;
+            cfg.loop_file = Some(PathBuf::from("/nonexistent/missing-loop-file.mp4"));
+            let state = AppState::from_config(&cfg);
+            let mut pipe =
+                MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
 
-        // Missing MP4 falls back to synthetic placeholder with warning; mode stays Loop
-        assert!(pipe.health().loop_warning.is_some());
-        assert_eq!(state.mode, StreamMode::Loop);
-        assert_eq!(pipe.active_video_source(), VideoSource::Loop);
-        pipe.stop();
+            // Missing MP4 falls back to synthetic placeholder with warning; mode stays Loop
+            assert!(pipe.health().loop_warning.is_some());
+            assert_eq!(state.mode, StreamMode::Loop);
+            assert_eq!(pipe.active_video_source(), VideoSource::Loop);
+            pipe.stop();
+        })
+        .unwrap();
     }
 }
