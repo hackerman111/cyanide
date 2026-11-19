@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -10,6 +10,8 @@ use crate::devices::modprobe_hint;
 use crate::pipeline::audio::AudioBranch;
 use crate::pipeline::{ForceFallback, PipelineError, PreviewBackend, PreviewObjects};
 use crate::state::VideoSource;
+
+pub const LOOP_EOS_MSG: &str = "cyanide-loop-eos";
 
 pub struct VideoBranch {
     pub selector: gst::Element,
@@ -21,6 +23,7 @@ pub struct VideoBranch {
     pub live_valve: gst::Element,
     pub out_valve: gst::Element,
     pub previews: PreviewObjects,
+    pub rebaser: Arc<SegmentRebaser>,
     pub loop_warning: Option<String>,
     pub live_warning: Option<String>,
     pub output_warning: Option<String>,
@@ -34,6 +37,7 @@ impl VideoBranch {
         test_sources: bool,
         fallback: ForceFallback,
         audio: &Arc<AudioBranch>,
+        rebaser: Arc<SegmentRebaser>,
     ) -> Result<Self, PipelineError> {
         let common_caps = common_video_caps(cfg.video.width, cfg.video.height, cfg.video.fps);
 
@@ -58,6 +62,7 @@ impl VideoBranch {
             fallback.loop_black,
             &loop_sel_pad,
             audio,
+            &rebaser,
         )?;
 
         let (live_valve, live_sink, live_warning) = build_live_branch(
@@ -66,7 +71,7 @@ impl VideoBranch {
             &common_caps,
             backend,
             test_sources,
-            fallback.live_black,
+            fallback.live_video_black,
             &live_sel_pad,
         )?;
 
@@ -74,6 +79,10 @@ impl VideoBranch {
         out_queue.set_property("max-size-time", 2_000_000_000u64);
         out_queue.set_property("max-size-buffers", 0u32);
         out_queue.set_property("max-size-bytes", 0u32);
+
+        // clocksync paces output after video_out_queue so pad.set_offset() actually delays
+        // both v4l2sink and out_preview when av_delay_ms < 0 despite v4l2sink(sync=false).
+        let out_clocksync = make_element("clocksync", Some("video_out_clocksync"))?;
 
         let out_tee = make_element("tee", Some("out_tee"))?;
         out_tee.set_property("allow-not-linked", true);
@@ -92,6 +101,7 @@ impl VideoBranch {
 
         pipeline.add_many([
             &out_queue,
+            &out_clocksync,
             &out_tee,
             &out_broadcast_queue,
             &out_convert,
@@ -102,6 +112,7 @@ impl VideoBranch {
         gst::Element::link_many([
             &selector,
             &out_queue,
+            &out_clocksync,
             &out_tee,
             &out_broadcast_queue,
             &out_convert,
@@ -126,6 +137,7 @@ impl VideoBranch {
                 live_sink,
                 out_sink,
             },
+            rebaser,
             loop_warning,
             live_warning,
             output_warning,
@@ -160,10 +172,18 @@ impl VideoBranch {
         self.out_valve.set_property("drop", drop_frames);
     }
 
-    pub fn seek_loop(&self, position_ms: u64, flushing: bool) -> bool {
+    pub fn seek_loop(&self, pipeline: &gst::Pipeline, position_ms: u64, flushing: bool) -> bool {
         let Some(ref src) = self.loop_source else {
             return false;
         };
+        if flushing {
+            // Rebase post-seek GstSegment.base to the live pipeline running_time so
+            // audiomixer and clocksync do not drop frames/audio after Restart/Bookmark seeks.
+            let rt_ns = pipeline
+                .current_running_time()
+                .map_or(0, gst::ClockTime::nseconds);
+            self.rebaser.mark_flushing_seek(rt_ns);
+        }
         let mut flags = gst::SeekFlags::SEGMENT | gst::SeekFlags::ACCURATE;
         if flushing {
             flags |= gst::SeekFlags::FLUSH;
@@ -197,6 +217,7 @@ fn build_loop_branch(
     force_black: bool,
     sel_pad: &gst::Pad,
     audio: &Arc<AudioBranch>,
+    rebaser: &Arc<SegmentRebaser>,
 ) -> Result<
     (
         Option<gst::Element>,
@@ -211,13 +232,19 @@ fn build_loop_branch(
     let scale = make_element("videoscale", Some("loop_scale"))?;
     let rate = make_element("videorate", Some("loop_rate"))?;
     let caps = make_capsfilter("loop_caps", common_caps)?;
+    // clocksync paces non-live MP4 uridecodebin frames at 1x real-time even when audio-less.
+    let clocksync = make_element("clocksync", Some("loop_clocksync"))?;
     let tee = make_element("tee", Some("loop_tee"))?;
     tee.set_property("allow-not-linked", true);
     let sel_queue = make_element("queue", Some("loop_sel_queue"))?;
 
-    pipeline.add_many([&queue, &convert, &scale, &rate, &caps, &tee, &sel_queue])?;
-    gst::Element::link_many([&queue, &convert, &scale, &rate, &caps, &tee, &sel_queue])
-        .map_err(|e| PipelineError::Link(format!("loop video chain: {e}")))?;
+    pipeline.add_many([
+        &queue, &convert, &scale, &rate, &caps, &clocksync, &tee, &sel_queue,
+    ])?;
+    gst::Element::link_many([
+        &queue, &convert, &scale, &rate, &caps, &clocksync, &tee, &sel_queue,
+    ])
+    .map_err(|e| PipelineError::Link(format!("loop video chain: {e}")))?;
 
     let src_pad = sel_queue
         .static_pad("src")
@@ -245,6 +272,40 @@ fn build_loop_branch(
         let decodebin = make_element("uridecodebin", Some("loop_uridecodebin"))?;
         decodebin.set_property("uri", uri.as_str());
         pipeline.add(&decodebin)?;
+
+        // Rebase segment base on flushing seeks and trap upstream demuxer EOS before it stalls.
+        if let Some(q_src) = queue.static_pad("src") {
+            let reb = Arc::clone(rebaser);
+            let seen_gen = AtomicU64::new(0);
+            let weak_pipe = pipeline.downgrade();
+            q_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+                    match ev.view() {
+                        gst::EventView::Segment(seg_ev) => {
+                            if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+                                && let Some(rebased) = reb.rebase_if_needed(&seen_gen, seg)
+                            {
+                                let new_ev = gst::event::Segment::builder(&rebased)
+                                    .seqnum(ev.seqnum())
+                                    .build();
+                                info.data = Some(gst::PadProbeData::Event(new_ev));
+                            }
+                        }
+                        gst::EventView::Eos(_) => {
+                            if let Some(p) = weak_pipe.upgrade() {
+                                let msg = gst::message::Application::new(
+                                    gst::Structure::new_empty(LOOP_EOS_MSG),
+                                );
+                                let _ = p.post_message(msg);
+                            }
+                            return gst::PadProbeReturn::Drop;
+                        }
+                        _ => {}
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
 
         let video_linked = Arc::new(AtomicBool::new(false));
         let video_queue = queue.clone();
@@ -494,4 +555,72 @@ fn make_capsfilter(name: &str, caps: &gst::Caps) -> Result<gst::Element, Pipelin
     let filter = make_element("capsfilter", Some(name))?;
     filter.set_property("caps", caps);
     Ok(filter)
+}
+
+#[derive(Default)]
+pub struct SegmentRebaser {
+    seek_gen: AtomicU64,
+    rebase_base_ns: AtomicU64,
+}
+
+impl SegmentRebaser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_flushing_seek(&self, running_time_ns: u64) {
+        self.rebase_base_ns
+            .store(running_time_ns, Ordering::Relaxed);
+        self.seek_gen.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn rebase_if_needed(
+        &self,
+        seen_gen: &AtomicU64,
+        seg: &gst::FormattedSegment<gst::ClockTime>,
+    ) -> Option<gst::FormattedSegment<gst::ClockTime>> {
+        let cur_gen = self.seek_gen.load(Ordering::Acquire);
+        if cur_gen == 0 || cur_gen == seen_gen.load(Ordering::Relaxed) {
+            return None;
+        }
+        seen_gen.store(cur_gen, Ordering::Relaxed);
+        let base_ns = self.rebase_base_ns.load(Ordering::Relaxed);
+        let mut rebased = seg.clone();
+        rebased.set_base(gst::ClockTime::from_nseconds(base_ns));
+        Some(rebased)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn segment_rebase_aligns_flushing_seek_without_touching_segment_done() {
+        gst::init().unwrap();
+        let rebaser = SegmentRebaser::new();
+        let video_gen = AtomicU64::new(0);
+        let audio_gen = AtomicU64::new(0);
+
+        // Before any flushing seek, segment passes through untouched.
+        let mut raw_seg = gst::FormattedSegment::<gst::ClockTime>::new();
+        raw_seg.set_base(gst::ClockTime::ZERO);
+        assert!(rebaser.rebase_if_needed(&video_gen, &raw_seg).is_none());
+
+        // After flushing seek at running_time = 5s, BOTH video and audio rebase once to 5s.
+        rebaser.mark_flushing_seek(5_000_000_000);
+        let v_rebased = rebaser
+            .rebase_if_needed(&video_gen, &raw_seg)
+            .expect("video probe must rebase after flushing seek");
+        let a_rebased = rebaser
+            .rebase_if_needed(&audio_gen, &raw_seg)
+            .expect("audio probe must rebase after flushing seek");
+        assert_eq!(v_rebased.base(), Some(gst::ClockTime::from_seconds(5)));
+        assert_eq!(a_rebased.base(), Some(gst::ClockTime::from_seconds(5)));
+
+        // Subsequent non-flushing SegmentDone segment (same seek gen) stays untouched.
+        assert!(rebaser.rebase_if_needed(&video_gen, &raw_seg).is_none());
+        assert!(rebaser.rebase_if_needed(&audio_gen, &raw_seg).is_none());
+    }
 }

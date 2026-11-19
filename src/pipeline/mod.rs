@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::config::{Config, LoopReturnPolicy};
 use crate::pipeline::audio::{AudioBranch, GainRamp, parse_level_message};
-use crate::pipeline::video::VideoBranch;
+use crate::pipeline::video::{LOOP_EOS_MSG, SegmentRebaser, VideoBranch};
 use crate::state::{AppState, AudioLevels, SourceHealth, VideoSource};
 
 #[derive(Debug, Error)]
@@ -36,10 +36,18 @@ pub enum PreviewBackend {
     Fake,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradedBranch {
+    Loop,
+    LiveVideo,
+    LiveAudio,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForceFallback {
     pub loop_black: bool,
-    pub live_black: bool,
+    pub live_video_black: bool,
+    pub live_audio_silence: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,8 +60,14 @@ pub struct PreviewObjects {
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
     Levels(AudioLevels),
-    Position { pos_ms: u64, dur_ms: Option<u64> },
-    Degraded { branch: VideoSource, reason: String },
+    Position {
+        pos_ms: u64,
+        dur_ms: Option<u64>,
+    },
+    Degraded {
+        branch: DegradedBranch,
+        reason: String,
+    },
     FatalError(String),
 }
 
@@ -94,7 +108,14 @@ impl MediaPipeline {
         on_event: impl Fn(PipelineEvent) + 'static,
     ) -> Result<Self, PipelineError> {
         let pipeline = gst::Pipeline::with_name("cyanide_pipeline");
-        let audio = Arc::new(AudioBranch::build(&pipeline, cfg, test_sources)?);
+        let rebaser = Arc::new(SegmentRebaser::new());
+        let audio = Arc::new(AudioBranch::build(
+            &pipeline,
+            cfg,
+            test_sources,
+            fallback,
+            Arc::clone(&rebaser),
+        )?);
         let video = Rc::new(VideoBranch::build(
             &pipeline,
             cfg,
@@ -102,6 +123,7 @@ impl MediaPipeline {
             test_sources,
             fallback,
             &audio,
+            rebaser,
         )?);
 
         video.select(state.mode.video());
@@ -136,10 +158,10 @@ impl MediaPipeline {
             match return_policy {
                 LoopReturnPolicy::Continue => {}
                 LoopReturnPolicy::Restart => {
-                    self.video.seek_loop(0, true);
+                    self.video.seek_loop(&self.pipeline, 0, true);
                 }
                 LoopReturnPolicy::Bookmark { position_ms } => {
-                    self.video.seek_loop(position_ms, true);
+                    self.video.seek_loop(&self.pipeline, position_ms, true);
                 }
             }
         }
@@ -245,6 +267,7 @@ pub fn check_runtime_plugins() -> Vec<(&'static str, bool)> {
         "videoconvert",
         "videoscale",
         "videorate",
+        "clocksync",
         "input-selector",
         "valve",
         "audioconvert",
@@ -280,22 +303,40 @@ fn attach_bus_watch(
     on_event: impl Fn(PipelineEvent) + 'static,
 ) -> Option<BusWatchGuard> {
     let bus = pipeline.bus()?;
+    let weak_pipe = pipeline.downgrade();
     let armed_segment = AtomicBool::new(false);
     let levels = RefCell::new(AudioLevels::default());
 
     bus.add_watch_local(move |_bus, msg| {
         match msg.view() {
             gst::MessageView::AsyncDone(_) => {
-                if video.loop_source.is_some() && !armed_segment.swap(true, Ordering::AcqRel) {
-                    video.seek_loop(0, true);
+                if video.loop_source.is_some()
+                    && !armed_segment.swap(true, Ordering::AcqRel)
+                    && let Some(p) = weak_pipe.upgrade()
+                {
+                    video.seek_loop(&p, 0, true);
                 }
             }
             gst::MessageView::SegmentDone(_) => {
-                video.seek_loop(0, false);
+                if let Some(p) = weak_pipe.upgrade() {
+                    video.seek_loop(&p, 0, false);
+                }
+            }
+            gst::MessageView::Application(app_msg) => {
+                if app_msg
+                    .structure()
+                    .is_some_and(|s| s.name() == LOOP_EOS_MSG)
+                    && video.loop_source.is_some()
+                    && let Some(p) = weak_pipe.upgrade()
+                {
+                    video.seek_loop(&p, 0, true);
+                }
             }
             gst::MessageView::Eos(_) => {
-                if video.loop_source.is_some() {
-                    video.seek_loop(0, true);
+                if video.loop_source.is_some()
+                    && let Some(p) = weak_pipe.upgrade()
+                {
+                    video.seek_loop(&p, 0, true);
                 }
             }
             gst::MessageView::Element(_) => {
@@ -329,14 +370,16 @@ fn attach_bus_watch(
     .ok()
 }
 
-fn classify_error_branch(src_path: &str) -> Option<VideoSource> {
+fn classify_error_branch(src_path: &str) -> Option<DegradedBranch> {
     if src_path.contains("loop_") || src_path.contains("uridecodebin") {
-        Some(VideoSource::Loop)
-    } else if src_path.contains("live_")
-        || src_path.contains("v4l2src")
+        Some(DegradedBranch::Loop)
+    } else if src_path.contains("live_mic_src")
+        || src_path.contains("live_audio_")
         || src_path.contains("pulsesrc")
     {
-        Some(VideoSource::Live)
+        Some(DegradedBranch::LiveAudio)
+    } else if src_path.contains("live_") || src_path.contains("v4l2src") {
+        Some(DegradedBranch::LiveVideo)
     } else {
         None
     }
@@ -414,5 +457,47 @@ mod tests {
             pipe.stop();
         })
         .unwrap();
+    }
+
+    #[test]
+    fn pipeline_has_clocksync_on_loop_and_output_for_pacing_and_av_delay() {
+        gst::init().unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let cfg = Config::default();
+            let state = AppState::from_config(&cfg);
+            let mut pipe =
+                MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
+
+            assert!(
+                pipe.pipeline.by_name("loop_clocksync").is_some(),
+                "loop branch must include clocksync for 1x MP4 pacing"
+            );
+            assert!(
+                pipe.pipeline.by_name("video_out_clocksync").is_some(),
+                "video output must include clocksync after video_out_queue so negative av_delay_ms takes effect"
+            );
+
+            pipe.set_av_delay_ms(-250);
+            let v_off = pipe.video.out_queue.static_pad("src").unwrap().offset();
+            let a_off = pipe.audio.out_queue.static_pad("src").unwrap().offset();
+            assert_eq!(v_off, 250_000_000);
+            assert_eq!(a_off, 0);
+
+            pipe.stop();
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn classify_error_isolates_live_audio_from_live_video() {
+        let mic = classify_error_branch("/cyanide_pipeline/live_mic_src");
+        let cam = classify_error_branch("/cyanide_pipeline/live_v4l2_src");
+        let lp = classify_error_branch("/cyanide_pipeline/loop_uridecodebin");
+        assert!(mic.is_some() && cam.is_some() && lp.is_some());
+        assert_ne!(
+            mic, cam,
+            "pulsesrc/live_mic_src errors must NOT degrade the live camera branch"
+        );
     }
 }

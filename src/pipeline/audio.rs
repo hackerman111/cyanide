@@ -1,11 +1,13 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
 use crate::config::{Config, is_forbidden_mic};
 use crate::devices::VIRTUAL_SINK_NAME;
-use crate::pipeline::PipelineError;
+use crate::pipeline::video::SegmentRebaser;
+use crate::pipeline::{ForceFallback, PipelineError};
 
 pub const AUDIO_RATE: i32 = 48_000;
 pub const AUDIO_CHANNELS: i32 = 2;
@@ -60,6 +62,7 @@ impl GainRamp {
 
 pub struct AudioBranch {
     pipeline: gst::glib::WeakRef<gst::Pipeline>,
+    rebaser: Arc<SegmentRebaser>,
     pub loop_vol: gst::Element,
     pub live_vol: gst::Element,
     pub out_queue: gst::Element,
@@ -75,6 +78,8 @@ impl AudioBranch {
         pipeline: &gst::Pipeline,
         cfg: &Config,
         test_sources: bool,
+        fallback: ForceFallback,
+        rebaser: Arc<SegmentRebaser>,
     ) -> Result<Self, PipelineError> {
         let audio_caps = canonical_audio_caps();
 
@@ -92,7 +97,8 @@ impl AudioBranch {
         silence_src.set_property("is-live", true);
         let silence_caps = make_capsfilter("silence_caps", &audio_caps)?;
 
-        let (live_src, live_warning) = build_live_audio_source(cfg, test_sources)?;
+        let (live_src, live_warning) =
+            build_live_audio_source(cfg, test_sources, fallback.live_audio_silence)?;
         let live_queue = make_element("queue", Some("live_audio_queue"))?;
         let live_convert = make_element("audioconvert", Some("live_audio_convert"))?;
         let live_resample = make_element("audioresample", Some("live_audio_resample"))?;
@@ -162,6 +168,7 @@ impl AudioBranch {
 
         Ok(Self {
             pipeline: pipeline.downgrade(),
+            rebaser,
             loop_vol,
             live_vol,
             out_queue,
@@ -183,12 +190,15 @@ impl AudioBranch {
         };
 
         let Ok(convert) = make_element("audioconvert", Some("loop_audio_convert")) else {
+            self.loop_attached.store(false, Ordering::Release);
             return false;
         };
         let Ok(resample) = make_element("audioresample", Some("loop_audio_resample")) else {
+            self.loop_attached.store(false, Ordering::Release);
             return false;
         };
         let Ok(caps) = make_capsfilter("loop_audio_caps", &canonical_audio_caps()) else {
+            self.loop_attached.store(false, Ordering::Release);
             return false;
         };
         let level = try_make_level("loop_level");
@@ -214,6 +224,34 @@ impl AudioBranch {
             let _ = pipeline.remove_many(&added);
             self.loop_attached.store(false, Ordering::Release);
             return false;
+        }
+
+        // Rebase segment base after flushing seeks so audiomixer never drops post-seek audio,
+        // and drop upstream EOS so audiomixer keeps the loop pad open across restarts.
+        if let Some(src_pad) = self.loop_input_queue.static_pad("src") {
+            let rebaser = Arc::clone(&self.rebaser);
+            let seen_gen = AtomicU64::new(0);
+            src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+                    match ev.view() {
+                        gst::EventView::Segment(seg_ev) => {
+                            if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+                                && let Some(rebased) = rebaser.rebase_if_needed(&seen_gen, seg)
+                            {
+                                let new_ev = gst::event::Segment::builder(&rebased)
+                                    .seqnum(ev.seqnum())
+                                    .build();
+                                info.data = Some(gst::PadProbeData::Event(new_ev));
+                            }
+                        }
+                        gst::EventView::Eos(_) => {
+                            return gst::PadProbeReturn::Drop;
+                        }
+                        _ => {}
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
         }
 
         for el in &added {
@@ -272,13 +310,44 @@ fn canonical_audio_caps() -> gst::Caps {
 fn build_live_audio_source(
     cfg: &Config,
     test_sources: bool,
+    force_silence: bool,
 ) -> Result<(gst::Element, Option<String>), PipelineError> {
+    if force_silence {
+        let src = make_element("audiotestsrc", Some("live_audio_fallback"))?;
+        src.set_property_from_str("wave", "silence");
+        src.set_property("is-live", true);
+        return Ok((
+            src,
+            Some("Ошибка реального микрофона — используется тишина".into()),
+        ));
+    }
+
     if test_sources {
         let src = make_element("audiotestsrc", Some("live_audio_test"))?;
         src.set_property_from_str("wave", "silence");
         src.set_property("is-live", true);
         return Ok((src, None));
     }
+
+    // Never bind unconstrained pulsesrc (@DEFAULT_SOURCE@): if VirtualCamMic or a monitor
+    // is the system default source, that would create an audio feedback loop.
+    let Some(dev) = cfg
+        .real_mic
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !is_forbidden_mic(d))
+    else {
+        let src = make_element("audiotestsrc", Some("live_audio_fallback"))?;
+        src.set_property_from_str("wave", "silence");
+        src.set_property("is-live", true);
+        return Ok((
+            src,
+            Some(
+                "Реальный микрофон не выбран — используется тишина (защита от обратной связи)"
+                    .into(),
+            ),
+        ));
+    };
 
     if gst::ElementFactory::find("pulsesrc").is_none() {
         let src = make_element("audiotestsrc", Some("live_audio_fallback"))?;
@@ -291,12 +360,7 @@ fn build_live_audio_source(
     }
 
     let src = make_element("pulsesrc", Some("live_mic_src"))?;
-    if let Some(dev) = cfg.real_mic.as_deref()
-        && !dev.is_empty()
-        && !is_forbidden_mic(dev)
-    {
-        src.set_property("device", dev);
-    }
+    src.set_property("device", dev);
     Ok((src, None))
 }
 
@@ -398,12 +462,46 @@ mod tests {
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let cfg = Config::default();
-        let branch = AudioBranch::build(&pipeline, &cfg, true).unwrap();
+        let branch = AudioBranch::build(
+            &pipeline,
+            &cfg,
+            true,
+            ForceFallback::default(),
+            Arc::new(SegmentRebaser::new()),
+        )
+        .unwrap();
         branch.set_gains(0.8, 0.0);
         branch.set_delay_ns(50_000_000);
         pipeline.set_state(gst::State::Playing).unwrap();
         let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(2));
         assert!(res.is_ok() && state == gst::State::Playing);
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn audio_branch_refuses_unconstrained_default_source_when_real_mic_none() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let cfg = Config {
+            real_mic: None,
+            ..Default::default()
+        };
+        let branch = AudioBranch::build(
+            &pipeline,
+            &cfg,
+            false,
+            ForceFallback::default(),
+            Arc::new(SegmentRebaser::new()),
+        )
+        .unwrap();
+        assert!(pipeline.by_name("live_mic_src").is_none());
+        assert!(
+            branch
+                .live_warning
+                .as_deref()
+                .is_some_and(|w| w.contains("микрофон") && w.contains("тишина")),
+            "expected explicit no-mic silence warning, got {:?}",
+            branch.live_warning
+        );
     }
 }

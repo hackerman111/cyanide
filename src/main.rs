@@ -15,8 +15,10 @@ use cyanide::devices::{
 };
 use cyanide::gui::{ConfigPatch, MainWindow, UiAction};
 use cyanide::ipc::{self, IpcRequest, IpcServerHandle};
-use cyanide::pipeline::{self, ForceFallback, MediaPipeline, PipelineEvent, PreviewBackend};
-use cyanide::state::{AppState, Command, Reply, VideoSource};
+use cyanide::pipeline::{
+    self, DegradedBranch, ForceFallback, MediaPipeline, PipelineEvent, PreviewBackend,
+};
+use cyanide::state::{AppState, Command, Reply};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
@@ -304,16 +306,22 @@ fn handle_pipeline_event(ctrl: &Rc<RefCell<AppController>>, event: PipelineEvent
         PipelineEvent::Degraded { branch, reason } => {
             // Privacy invariant: NEVER alter `state.mode` (never auto-switch Loop -> Live).
             let should_rebuild = {
-                let mut c = ctrl.borrow_mut();
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
                 match branch {
-                    VideoSource::Loop if !c.fallback.loop_black => {
+                    DegradedBranch::Loop if !c.fallback.loop_black => {
                         c.fallback.loop_black = true;
                         eprintln!("loop branch degraded ({reason}); falling back to black");
                         true
                     }
-                    VideoSource::Live if !c.fallback.live_black => {
-                        c.fallback.live_black = true;
-                        eprintln!("live branch degraded ({reason}); falling back to black");
+                    DegradedBranch::LiveVideo if !c.fallback.live_video_black => {
+                        c.fallback.live_video_black = true;
+                        eprintln!("live video degraded ({reason}); falling back to black");
+                        true
+                    }
+                    DegradedBranch::LiveAudio if !c.fallback.live_audio_silence => {
+                        c.fallback.live_audio_silence = true;
+                        eprintln!("live audio degraded ({reason}); falling back to silence");
                         true
                     }
                     _ => false,
@@ -442,7 +450,8 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
         }
         UiAction::PickLoopFile(path) => {
             {
-                let mut c = ctrl.borrow_mut();
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
                 c.config.loop_file = Some(path);
                 c.fallback.loop_black = false;
             }
@@ -450,14 +459,28 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             rebuild_pipeline(ctrl);
         }
         UiAction::RefreshDevices => {
-            let mut c = ctrl.borrow_mut();
-            c.devices = devices::discover_all();
-            c.hydrate_default_devices();
-            c.sync_window();
+            let (config_changed, needs_rebuild) = {
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
+                let inv = devices::discover_all();
+                let had_warning = c.state.health.live_warning.is_some()
+                    || c.state.health.output_warning.is_some();
+                let (changed, rebuild) = apply_device_refresh(&mut c.config, &mut c.fallback, &inv);
+                c.devices = inv;
+                c.sync_window();
+                (changed, rebuild || had_warning)
+            };
+            if config_changed {
+                schedule_config_save(ctrl);
+            }
+            if needs_rebuild {
+                rebuild_pipeline(ctrl);
+            }
         }
         UiAction::SetReturnBookmarkCurrent => {
             {
-                let mut c = ctrl.borrow_mut();
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
                 let pos = c
                     .pipeline
                     .as_ref()
@@ -475,13 +498,14 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             let mut av_delay_changed = false;
 
             {
-                let mut c = ctrl.borrow_mut();
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
                 match patch {
                     ConfigPatch::StartupMode(m) => c.config.startup_mode = m,
                     ConfigPatch::RealCamera(cam) => {
                         if c.config.real_camera != cam {
                             c.config.real_camera = cam;
-                            c.fallback.live_black = false;
+                            c.fallback.live_video_black = false;
                             needs_rebuild = true;
                         }
                     }
@@ -494,6 +518,7 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                     ConfigPatch::RealMic(mic) => {
                         if c.config.real_mic != mic {
                             c.config.real_mic = mic;
+                            c.fallback.live_audio_silence = false;
                             needs_rebuild = true;
                         }
                     }
@@ -790,6 +815,38 @@ fn main() -> ExitCode {
     }
 }
 
+fn apply_device_refresh(
+    cfg: &mut Config,
+    fallback: &mut ForceFallback,
+    inv: &DeviceInventory,
+) -> (bool, bool) {
+    let mut config_changed = false;
+    if cfg.real_camera.is_none()
+        && let Some(first) = inv.real_cameras.first()
+    {
+        cfg.real_camera = Some(first.path.clone());
+        config_changed = true;
+    }
+    if cfg.virtual_camera.is_none()
+        && let Some(first) = inv.loopback_cameras.first()
+    {
+        cfg.virtual_camera = Some(first.path.clone());
+        config_changed = true;
+    }
+    if cfg.real_mic.is_none()
+        && let Some(first) = inv.real_mics.first()
+    {
+        cfg.real_mic = Some(first.name.clone());
+        config_changed = true;
+    }
+
+    let had_live_fallback = fallback.live_video_black || fallback.live_audio_silence;
+    fallback.live_video_black = false;
+    fallback.live_audio_silence = false;
+
+    (config_changed, config_changed || had_live_fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +870,34 @@ mod tests {
             CliAction::Ctl(Command::SetAudio(AudioSource::Silence))
         );
         assert_eq!(parse_cli(["cyanide", "doctor"]).unwrap(), CliAction::Doctor);
+    }
+
+    #[test]
+    fn refresh_devices_resets_fallbacks_and_requests_rebuild() {
+        let mut cfg = Config::default();
+        let mut fb = ForceFallback {
+            loop_black: false,
+            live_video_black: true,
+            live_audio_silence: true,
+        };
+        let inv = DeviceInventory {
+            real_cameras: vec![devices::VideoDevice {
+                path: "/dev/video0".into(),
+                name: "HD Camera".into(),
+                is_loopback: false,
+            }],
+            loopback_cameras: vec![devices::VideoDevice {
+                path: "/dev/video10".into(),
+                name: "VirtualCam".into(),
+                is_loopback: true,
+            }],
+            real_mics: vec![],
+        };
+        let (config_changed, needs_rebuild) = apply_device_refresh(&mut cfg, &mut fb, &inv);
+        assert!(config_changed);
+        assert!(needs_rebuild);
+        assert!(!fb.live_video_black);
+        assert!(!fb.live_audio_silence);
+        assert_eq!(cfg.virtual_camera.as_deref(), Some("/dev/video10"));
     }
 }

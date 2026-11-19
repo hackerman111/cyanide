@@ -19,6 +19,12 @@ const RESOLUTIONS: &[(u32, u32, &str)] = &[
 ];
 const FPS_OPTIONS: &[u32] = &[15, 24, 30, 60];
 
+#[derive(Default)]
+struct ComboBacking {
+    keys: Vec<Option<String>>,
+    labels: Vec<String>,
+}
+
 pub struct ControlPanel {
     pub widget: gtk4::ScrolledWindow,
     syncing: Rc<Cell<bool>>,
@@ -44,9 +50,9 @@ pub struct ControlPanel {
     crossfade_label: gtk4::Label,
     return_combo: adw::ComboRow,
     bookmark_label: gtk4::Label,
-    real_cam_paths: Rc<RefCell<Vec<String>>>,
-    virt_cam_paths: Rc<RefCell<Vec<String>>>,
-    real_mic_names: Rc<RefCell<Vec<String>>>,
+    real_cam_paths: Rc<RefCell<ComboBacking>>,
+    virt_cam_paths: Rc<RefCell<ComboBacking>>,
+    real_mic_names: Rc<RefCell<ComboBacking>>,
 }
 
 impl ControlPanel {
@@ -238,9 +244,9 @@ impl ControlPanel {
         loop_file_row.add_suffix(&pick_btn);
         src_group.add(&loop_file_row);
 
-        let real_cam_paths = Rc::new(RefCell::new(Vec::<String>::new()));
-        let virt_cam_paths = Rc::new(RefCell::new(Vec::<String>::new()));
-        let real_mic_names = Rc::new(RefCell::new(Vec::<String>::new()));
+        let real_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
+        let virt_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
+        let real_mic_names = Rc::new(RefCell::new(ComboBacking::default()));
 
         let real_cam_combo = adw::ComboRow::builder().title("Реальная камера").build();
         {
@@ -251,7 +257,7 @@ impl ControlPanel {
                 if s.get() {
                     return;
                 }
-                if let Some(p) = paths.borrow().get(c.selected() as usize) {
+                if let Some(Some(p)) = paths.borrow().keys.get(c.selected() as usize) {
                     act(UiAction::UpdateConfig(ConfigPatch::RealCamera(Some(
                         p.clone(),
                     ))));
@@ -269,7 +275,7 @@ impl ControlPanel {
                 if s.get() {
                     return;
                 }
-                if let Some(p) = paths.borrow().get(c.selected() as usize) {
+                if let Some(Some(p)) = paths.borrow().keys.get(c.selected() as usize) {
                     act(UiAction::UpdateConfig(ConfigPatch::VirtualCamera(Some(
                         p.clone(),
                     ))));
@@ -287,7 +293,7 @@ impl ControlPanel {
                 if s.get() {
                     return;
                 }
-                if let Some(n) = names.borrow().get(c.selected() as usize) {
+                if let Some(Some(n)) = names.borrow().keys.get(c.selected() as usize) {
                     act(UiAction::UpdateConfig(ConfigPatch::RealMic(Some(
                         n.clone(),
                     ))));
@@ -611,27 +617,22 @@ fn db_to_unit(db: f64) -> f64 {
 
 fn sync_combo(
     combo: &adw::ComboRow,
-    backing: &RefCell<Vec<String>>,
+    backing: &RefCell<ComboBacking>,
     items: Vec<(String, String)>,
     selected: Option<&str>,
     empty_label: &str,
 ) {
-    let mut keys = Vec::with_capacity(items.len());
-    let mut labels = Vec::with_capacity(items.len().max(1));
-    for (k, l) in items {
-        keys.push(k);
-        labels.push(l);
+    let (keys, labels, idx) = compute_combo_entries(&items, selected, empty_label);
+    let mut state = backing.borrow_mut();
+    if state.labels != labels {
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        combo.set_model(Some(&gtk4::StringList::new(&refs)));
+        state.labels = labels;
     }
-    if labels.is_empty() {
-        labels.push(empty_label.to_string());
+    state.keys = keys;
+    if combo.selected() != idx {
+        combo.set_selected(idx);
     }
-    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    combo.set_model(Some(&gtk4::StringList::new(&refs)));
-    let idx = selected
-        .and_then(|sel| keys.iter().position(|k| k == sel))
-        .unwrap_or(0) as u32;
-    *backing.borrow_mut() = keys;
-    combo.set_selected(idx);
 }
 
 fn make_slider_row(
@@ -682,4 +683,64 @@ fn make_meter_row(title: &str) -> (adw::ActionRow, gtk4::LevelBar) {
     let row = adw::ActionRow::builder().title(title).build();
     row.add_suffix(&bar);
     (row, bar)
+}
+
+pub(crate) fn compute_combo_entries(
+    items: &[(String, String)],
+    selected: Option<&str>,
+    empty_label: &str,
+) -> (Vec<Option<String>>, Vec<String>, u32) {
+    if let Some(sel) = selected {
+        if let Some(pos) = items.iter().position(|(k, _)| k == sel) {
+            let keys = items.iter().map(|(k, _)| Some(k.clone())).collect();
+            let labels = items.iter().map(|(_, l)| l.clone()).collect();
+            return (keys, labels, pos as u32);
+        }
+        // Configured device is absent: prepend a placeholder so index 0 does not trap selection.
+        let mut keys = Vec::with_capacity(items.len() + 1);
+        let mut labels = Vec::with_capacity(items.len() + 1);
+        keys.push(None);
+        labels.push(format!("(отключено) {sel}"));
+        for (k, l) in items {
+            keys.push(Some(k.clone()));
+            labels.push(l.clone());
+        }
+        return (keys, labels, 0);
+    }
+
+    if items.is_empty() {
+        return (vec![None], vec![empty_label.to_string()], 0);
+    }
+
+    let keys = items.iter().map(|(k, _)| Some(k.clone())).collect();
+    let labels = items.iter().map(|(_, l)| l.clone()).collect();
+    (keys, labels, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_combo_model_avoids_churn_and_preserves_missing_selection() {
+        let items = vec![
+            ("/dev/video0".into(), "HD Camera (/dev/video0)".into()),
+            ("/dev/video2".into(), "USB Cam (/dev/video2)".into()),
+        ];
+        let (keys, labels, idx) = compute_combo_entries(&items, Some("/dev/video2"), "Нет камер");
+        assert_eq!(
+            keys,
+            vec![Some("/dev/video0".into()), Some("/dev/video2".into())]
+        );
+        assert_eq!(labels.len(), 2);
+        assert_eq!(idx, 1);
+
+        // Unplugged/missing configured device gets a dedicated index-0 placeholder so
+        // picking /dev/video0 (index 1) fires selected-notify instead of being trapped!
+        let (keys, labels, idx) = compute_combo_entries(&items, Some("/dev/video99"), "Нет камер");
+        assert_eq!(idx, 0);
+        assert_eq!(keys[0], None);
+        assert_eq!(keys[1], Some("/dev/video0".into()));
+        assert!(labels[0].contains("/dev/video99"));
+    }
 }
