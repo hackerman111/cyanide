@@ -200,11 +200,8 @@ impl AppController {
         {
             self.config.virtual_camera = Some(first.path.clone());
         }
-        if self.config.real_mic.is_none()
-            && let Some(first) = self.devices.real_mics.first()
-        {
-            self.config.real_mic = Some(first.name.clone());
-        }
+        // Keep real_mic as None by default so original microphone audio is not passed through
+        // unless the user explicitly selects a microphone.
     }
 
     fn refresh_health(&mut self) {
@@ -592,6 +589,7 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             let mut audio_gain_changed = false;
             let mut av_delay_changed = false;
             let mut hotkey_changed = false;
+            let mut lag_changed = false;
 
             {
                 let mut guard = ctrl.borrow_mut();
@@ -655,6 +653,10 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                     ConfigPatch::Compare(cmp) => {
                         c.config.compare = cmp;
                     }
+                    ConfigPatch::Lag(lag) => {
+                        c.config.lag = lag;
+                        lag_changed = true;
+                    }
                 }
                 c.config = c.config.clone().sanitized();
 
@@ -670,6 +672,9 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                 }
                 if hotkey_changed {
                     c.sync_hotkey();
+                }
+                if lag_changed && let Some(ref pipe) = c.pipeline {
+                    pipe.set_lag_config(c.config.lag);
                 }
                 c.sync_window();
             }
@@ -949,12 +954,6 @@ fn apply_device_refresh(
         && let Some(first) = inv.loopback_cameras.first()
     {
         cfg.virtual_camera = Some(first.path.clone());
-        config_changed = true;
-    }
-    if cfg.real_mic.is_none()
-        && let Some(first) = inv.real_mics.first()
-    {
-        cfg.real_mic = Some(first.name.clone());
         config_changed = true;
     }
 

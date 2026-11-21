@@ -12,7 +12,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::{
-    CompareConfig, CompareMode, Config, LoopReturnPolicy, StartupMode, VideoFormat,
+    CompareConfig, CompareMode, Config, LagConfig, LoopReturnPolicy, StartupMode, VideoFormat,
 };
 use crate::devices::DeviceInventory;
 use crate::gui::compare::CompareView;
@@ -33,6 +33,7 @@ pub enum ConfigPatch {
     CrossfadeMs(u32),
     LoopReturn(LoopReturnPolicy),
     Compare(CompareConfig),
+    Lag(LagConfig),
 }
 
 #[derive(Debug, Clone)]

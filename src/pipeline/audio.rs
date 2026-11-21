@@ -329,8 +329,8 @@ fn build_live_audio_source(
         return Ok((src, None));
     }
 
-    // Never bind unconstrained pulsesrc (@DEFAULT_SOURCE@): if VirtualCamMic or a monitor
-    // is the system default source, that would create an audio feedback loop.
+    // Never bind unconstrained pulsesrc (@DEFAULT_SOURCE@): real_mic is None by default
+    // so original microphone audio is not passed through unless explicitly selected.
     let Some(dev) = cfg
         .real_mic
         .as_deref()
@@ -340,13 +340,7 @@ fn build_live_audio_source(
         let src = make_element("audiotestsrc", Some("live_audio_fallback"))?;
         src.set_property_from_str("wave", "silence");
         src.set_property("is-live", true);
-        return Ok((
-            src,
-            Some(
-                "Реальный микрофон не выбран — используется тишина (защита от обратной связи)"
-                    .into(),
-            ),
-        ));
+        return Ok((src, None));
     };
 
     if gst::ElementFactory::find("pulsesrc").is_none() {
@@ -495,12 +489,10 @@ mod tests {
         )
         .unwrap();
         assert!(pipeline.by_name("live_mic_src").is_none());
+        assert!(pipeline.by_name("live_audio_fallback").is_some());
         assert!(
-            branch
-                .live_warning
-                .as_deref()
-                .is_some_and(|w| w.contains("микрофон") && w.contains("тишина")),
-            "expected explicit no-mic silence warning, got {:?}",
+            branch.live_warning.is_none(),
+            "intentional disabled real_mic should not emit a warning banner, got {:?}",
             branch.live_warning
         );
     }

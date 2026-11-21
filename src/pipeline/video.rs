@@ -9,6 +9,7 @@ use gstreamer_video as gst_video;
 use crate::config::Config;
 use crate::devices::modprobe_hint;
 use crate::pipeline::audio::AudioBranch;
+use crate::pipeline::lag::LagController;
 use crate::pipeline::similarity::{FrameMatcher, FrameSide};
 use crate::pipeline::{ForceFallback, PipelineError, PreviewBackend, PreviewObjects};
 use crate::state::VideoSource;
@@ -26,6 +27,7 @@ pub struct VideoBranch {
     pub out_valve: gst::Element,
     pub previews: PreviewObjects,
     pub matcher: Arc<FrameMatcher>,
+    pub lag: Arc<LagController>,
     pub rebaser: Arc<SegmentRebaser>,
     pub loop_warning: Option<String>,
     pub live_warning: Option<String>,
@@ -130,6 +132,9 @@ impl VideoBranch {
         attach_similarity_probe(&loop_valve, FrameSide::Loop, Arc::clone(&matcher));
         attach_similarity_probe(&live_valve, FrameSide::Live, Arc::clone(&matcher));
 
+        let lag = Arc::new(LagController::new(cfg.lag));
+        attach_lag_probe(&out_clocksync, Arc::clone(&lag));
+
         Ok(Self {
             selector,
             loop_sel_pad,
@@ -145,6 +150,7 @@ impl VideoBranch {
                 out_sink,
             },
             matcher,
+            lag,
             rebaser,
             loop_warning,
             live_warning,
@@ -512,6 +518,31 @@ fn attach_similarity_probe(valve: &gst::Element, side: FrameSide, matcher: Arc<F
                         if let Some(ref vinfo) = *guard {
                             matcher.on_buffer(side, vinfo, buf);
                         }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
+fn attach_lag_probe(out_clocksync: &gst::Element, lag: Arc<LagController>) {
+    let Some(src_pad) = out_clocksync.static_pad("src") else {
+        return;
+    };
+    src_pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| {
+            match info.data {
+                Some(gst::PadProbeData::Event(ref ev)) => {
+                    if matches!(ev.view(), gst::EventView::Caps(_)) {
+                        lag.clear_held();
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(ref buf)) => {
+                    if let Some(frozen) = lag.process_buffer(buf) {
+                        info.data = Some(gst::PadProbeData::Buffer(frozen));
                     }
                 }
                 _ => {}

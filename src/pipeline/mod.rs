@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod lag;
 pub mod similarity;
 pub mod video;
 
@@ -14,7 +15,7 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 use thiserror::Error;
 
-use crate::config::{Config, LoopReturnPolicy};
+use crate::config::{Config, LagConfig, LoopReturnPolicy};
 use crate::pipeline::audio::{AudioBranch, GainRamp, parse_level_message};
 use crate::pipeline::video::{LOOP_EOS_MSG, SegmentRebaser, VideoBranch};
 use crate::state::{AppState, AudioLevels, SourceHealth, VideoSource};
@@ -156,6 +157,7 @@ impl MediaPipeline {
         return_policy: LoopReturnPolicy,
         switched_to_loop: bool,
     ) {
+        self.video.lag.trigger_switch_freeze();
         if switched_to_loop {
             match return_policy {
                 LoopReturnPolicy::Continue => {}
@@ -226,6 +228,10 @@ impl MediaPipeline {
 
     pub fn set_reference_frozen(&self, frozen: bool) {
         self.video.matcher.set_frozen(frozen);
+    }
+
+    pub fn set_lag_config(&self, lag: LagConfig) {
+        self.video.lag.update_config(lag);
     }
 
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {
