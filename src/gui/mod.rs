@@ -1,5 +1,6 @@
 pub mod compare;
 pub mod controls;
+pub mod overlay;
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ pub enum ConfigPatch {
     RealCamera(Option<String>),
     VirtualCamera(Option<String>),
     RealMic(Option<String>),
+    Hotkey(Option<String>),
     VideoFormat(VideoFormat),
     LoopVolume(f64),
     LiveVolume(f64),
@@ -40,11 +42,15 @@ pub enum UiAction {
     PickLoopFile(PathBuf),
     RefreshDevices,
     SetReturnBookmarkCurrent,
+    ToggleOverlay(bool),
+    SetHotkeyCapture(bool),
 }
 
 pub struct MainWindow {
     window: adw::ApplicationWindow,
     status_pill: gtk4::Label,
+    toggle_btn: gtk4::Button,
+    overlay_btn: gtk4::ToggleButton,
     banner: adw::Banner,
     loop_info_label: gtk4::Label,
     live_info_label: gtk4::Label,
@@ -98,13 +104,26 @@ impl MainWindow {
         status_pill.add_css_class("accent");
         header.pack_start(&status_pill);
 
-        let toggle_btn = gtk4::Button::with_label("Переключить (SUPER+F8)");
+        let toggle_btn = gtk4::Button::with_label("Переключить");
         toggle_btn.add_css_class("suggested-action");
         {
             let act = Rc::clone(&on_action);
             toggle_btn.connect_clicked(move |_| act(UiAction::Command(Command::Toggle)));
         }
         header.pack_end(&toggle_btn);
+
+        let overlay_btn = gtk4::ToggleButton::with_label("Плавающее окно");
+        overlay_btn.set_tooltip_text(Some("Показать/скрыть полупрозрачное окно с сеткой"));
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            overlay_btn.connect_toggled(move |b| {
+                if !s.get() {
+                    act(UiAction::ToggleOverlay(b.is_active()));
+                }
+            });
+        }
+        header.pack_end(&overlay_btn);
 
         let banner = adw::Banner::new("");
         banner.set_revealed(false);
@@ -471,6 +490,8 @@ impl MainWindow {
         Self {
             window,
             status_pill,
+            toggle_btn,
+            overlay_btn,
             banner,
             loop_info_label,
             live_info_label,
@@ -507,8 +528,24 @@ impl MainWindow {
         self.out_picture.set_paintable(out_p.as_ref());
     }
 
-    pub fn sync_state(&self, cfg: &Config, state: &AppState, devices: &DeviceInventory) {
+    pub fn sync_state(
+        &self,
+        cfg: &Config,
+        state: &AppState,
+        devices: &DeviceInventory,
+        overlay_visible: bool,
+        hotkey_error: Option<&str>,
+    ) {
         let prev = self.syncing.replace(true);
+
+        if let Some(ref hk) = cfg.hotkey {
+            self.toggle_btn.set_label(&format!("Переключить ({hk})"));
+        } else {
+            self.toggle_btn.set_label("Переключить");
+        }
+        if self.overlay_btn.is_active() != overlay_visible {
+            self.overlay_btn.set_active(overlay_visible);
+        }
 
         self.compare_cfg.set(cfg.compare);
         self.compare_view.set_config(cfg.compare);
@@ -578,7 +615,7 @@ impl MainWindow {
             self.banner.set_revealed(true);
         }
 
-        self.controls.sync_state(cfg, state, devices);
+        self.controls.sync_state(cfg, state, devices, hotkey_error);
         self.syncing.set(prev);
     }
 

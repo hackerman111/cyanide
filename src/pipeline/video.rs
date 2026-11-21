@@ -1,13 +1,15 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video as gst_video;
 
 use crate::config::Config;
 use crate::devices::modprobe_hint;
 use crate::pipeline::audio::AudioBranch;
+use crate::pipeline::similarity::{FrameMatcher, FrameSide};
 use crate::pipeline::{ForceFallback, PipelineError, PreviewBackend, PreviewObjects};
 use crate::state::VideoSource;
 
@@ -23,6 +25,7 @@ pub struct VideoBranch {
     pub live_valve: gst::Element,
     pub out_valve: gst::Element,
     pub previews: PreviewObjects,
+    pub matcher: Arc<FrameMatcher>,
     pub rebaser: Arc<SegmentRebaser>,
     pub loop_warning: Option<String>,
     pub live_warning: Option<String>,
@@ -123,6 +126,10 @@ impl VideoBranch {
 
         let (out_valve, out_sink) = attach_preview_leg(pipeline, &out_tee, "out", backend)?;
 
+        let matcher = Arc::new(FrameMatcher::new());
+        attach_similarity_probe(&loop_valve, FrameSide::Loop, Arc::clone(&matcher));
+        attach_similarity_probe(&live_valve, FrameSide::Live, Arc::clone(&matcher));
+
         Ok(Self {
             selector,
             loop_sel_pad,
@@ -137,6 +144,7 @@ impl VideoBranch {
                 live_sink,
                 out_sink,
             },
+            matcher,
             rebaser,
             loop_warning,
             live_warning,
@@ -476,6 +484,41 @@ fn attach_preview_leg(
             Ok((valve, sink))
         }
     }
+}
+
+fn attach_similarity_probe(valve: &gst::Element, side: FrameSide, matcher: Arc<FrameMatcher>) {
+    let Some(src_pad) = valve.static_pad("src") else {
+        return;
+    };
+    let cached_info: Mutex<Option<gst_video::VideoInfo>> = Mutex::new(None);
+    src_pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |pad, info| {
+            match info.data {
+                Some(gst::PadProbeData::Event(ref ev)) => {
+                    if let gst::EventView::Caps(c) = ev.view()
+                        && let Ok(mut guard) = cached_info.lock()
+                    {
+                        *guard = gst_video::VideoInfo::from_caps(c.caps()).ok();
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(ref buf)) => {
+                    if let Ok(mut guard) = cached_info.lock() {
+                        if guard.is_none() {
+                            *guard = pad
+                                .current_caps()
+                                .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok());
+                        }
+                        if let Some(ref vinfo) = *guard {
+                            matcher.on_buffer(side, vinfo, buf);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
 }
 
 fn build_virtual_cam_sink(

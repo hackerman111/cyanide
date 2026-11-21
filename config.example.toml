@@ -5,6 +5,7 @@ startup_mode = "live"
 # real_camera = "/dev/video0"
 # virtual_camera = "/dev/video10"
 # real_mic = "alsa_input.pci-0000_00_1f.3.analog-stereo"
+# hotkey = "SUPER+F8"
 
 loop_volume = 1.0
 live_volume = 1.0

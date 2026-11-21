@@ -13,7 +13,9 @@ use cyanide::config::{Config, LoopReturnPolicy};
 use cyanide::devices::{
     self, DeviceInventory, VIRTUAL_MIC_NAME, VIRTUAL_SINK_NAME, VirtualMicGuard, modprobe_hint,
 };
+use cyanide::gui::overlay::OverlayWindow;
 use cyanide::gui::{ConfigPatch, MainWindow, UiAction};
+use cyanide::hotkey::{Hotkey, HotkeyManager};
 use cyanide::ipc::{self, IpcRequest, IpcServerHandle};
 use cyanide::pipeline::{
     self, DegradedBranch, ForceFallback, MediaPipeline, PipelineEvent, PreviewBackend,
@@ -177,7 +179,10 @@ struct AppController {
     mic_init_warning: Option<String>,
     pipeline: Option<MediaPipeline>,
     ipc_server: Option<IpcServerHandle>,
+    hotkey_manager: HotkeyManager,
+    hotkey_error: Option<String>,
     window: Option<MainWindow>,
+    overlay: Option<OverlayWindow>,
     save_timer: Option<glib::SourceId>,
     timecode_timer: Option<glib::SourceId>,
     shutting_down: bool,
@@ -217,21 +222,56 @@ impl AppController {
         self.state.health = health;
     }
 
+    fn any_window_visible(&self) -> bool {
+        self.window.as_ref().is_some_and(MainWindow::is_visible)
+            || self.overlay.as_ref().is_some_and(OverlayWindow::is_visible)
+    }
+
+    fn sync_previews_active(&self) {
+        if let Some(ref pipe) = self.pipeline {
+            pipe.set_previews_active(self.any_window_visible());
+        }
+    }
+
+    fn sync_hotkey(&mut self) {
+        let parsed = self
+            .config
+            .hotkey
+            .as_deref()
+            .and_then(|s| Hotkey::parse(s).ok());
+        self.hotkey_error = self.hotkey_manager.apply(parsed.as_ref()).err();
+    }
+
     fn sync_window(&self) {
+        let overlay_visible = self.overlay.as_ref().is_some_and(OverlayWindow::is_visible);
         if let Some(ref win) = self.window {
-            win.sync_state(&self.config, &self.state, &self.devices);
+            win.sync_state(
+                &self.config,
+                &self.state,
+                &self.devices,
+                overlay_visible,
+                self.hotkey_error.as_deref(),
+            );
+        }
+        if let Some(ref ov) = self.overlay {
+            ov.sync_state(&self.config, &self.state);
         }
     }
 
     fn bind_pipeline_paintables(&self) {
-        let (Some(win), Some(pipe)) = (self.window.as_ref(), self.pipeline.as_ref()) else {
+        let Some(pipe) = self.pipeline.as_ref() else {
             return;
         };
         let previews = pipe.preview_objects();
         let loop_p = previews.loop_sink.property::<gdk::Paintable>("paintable");
         let live_p = previews.live_sink.property::<gdk::Paintable>("paintable");
         let out_p = previews.out_sink.property::<gdk::Paintable>("paintable");
-        win.bind_paintables(Some(loop_p), Some(live_p), Some(out_p));
+        if let Some(win) = self.window.as_ref() {
+            win.bind_paintables(Some(loop_p.clone()), Some(live_p.clone()), Some(out_p));
+        }
+        if let Some(ov) = self.overlay.as_ref() {
+            ov.bind_paintables(Some(loop_p), Some(live_p));
+        }
     }
 }
 
@@ -242,7 +282,7 @@ fn rebuild_pipeline(ctrl: &Rc<RefCell<AppController>>) {
         if let Some(mut old) = c.pipeline.take() {
             old.stop();
         }
-        let visible = c.window.as_ref().is_some_and(MainWindow::is_visible);
+        let visible = c.any_window_visible();
         (
             c.config.clone(),
             c.state.clone(),
@@ -357,13 +397,11 @@ fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
     });
 
     let weak_vis = Rc::downgrade(ctrl);
-    let on_visibility: Rc<dyn Fn(bool)> = Rc::new(move |visible| {
+    let on_visibility: Rc<dyn Fn(bool)> = Rc::new(move |_visible| {
         let weak_cb = weak_vis.clone();
         glib::idle_add_local_once(move || {
-            if let Some(c) = weak_cb.upgrade()
-                && let Some(ref pipe) = c.borrow().pipeline
-            {
-                pipe.set_previews_active(visible);
+            if let Some(c) = weak_cb.upgrade() {
+                c.borrow().sync_previews_active();
             }
         });
     });
@@ -374,6 +412,54 @@ fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
         c.window = Some(win);
         c.bind_pipeline_paintables();
         c.sync_window();
+    }
+}
+
+fn ensure_overlay(ctrl: &Rc<RefCell<AppController>>) {
+    if ctrl.borrow().overlay.is_some() {
+        return;
+    }
+
+    let app = ctrl.borrow().app.clone();
+    let weak_act = Rc::downgrade(ctrl);
+    let on_action: Rc<dyn Fn(UiAction)> = Rc::new(move |action| {
+        let weak_cb = weak_act.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(c) = weak_cb.upgrade() {
+                handle_ui_action(&c, action);
+            }
+        });
+    });
+
+    let weak_vis = Rc::downgrade(ctrl);
+    let on_visibility: Rc<dyn Fn(bool)> = Rc::new(move |_visible| {
+        let weak_cb = weak_vis.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(c) = weak_cb.upgrade() {
+                let inner = c.borrow();
+                inner.sync_previews_active();
+                inner.sync_window();
+            }
+        });
+    });
+
+    let ov = OverlayWindow::new(&app, on_action, on_visibility);
+    {
+        let mut c = ctrl.borrow_mut();
+        c.overlay = Some(ov);
+        c.bind_pipeline_paintables();
+        c.sync_window();
+    }
+}
+
+fn set_overlay_visible(ctrl: &Rc<RefCell<AppController>>, visible: bool) {
+    if visible {
+        ensure_overlay(ctrl);
+        if let Some(ref ov) = ctrl.borrow().overlay {
+            ov.present();
+        }
+    } else if let Some(ref ov) = ctrl.borrow().overlay {
+        ov.hide();
     }
 }
 
@@ -436,6 +522,9 @@ fn apply_command(ctrl: &Rc<RefCell<AppController>>, cmd: Command) -> Reply {
                 if effect.audio_changed {
                     pipe.start_audio_ramp(target, crossfade_ms);
                 }
+                if let Command::SetFreeze { frozen } = mode_cmd {
+                    pipe.set_reference_frozen(frozen);
+                }
             }
             c.sync_window();
             Reply::Status(c.state.snapshot(&c.config))
@@ -492,10 +581,17 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             }
             schedule_config_save(ctrl);
         }
+        UiAction::ToggleOverlay(visible) => {
+            set_overlay_visible(ctrl, visible);
+        }
+        UiAction::SetHotkeyCapture(capturing) => {
+            ctrl.borrow_mut().hotkey_manager.set_suspended(capturing);
+        }
         UiAction::UpdateConfig(patch) => {
             let mut needs_rebuild = false;
             let mut audio_gain_changed = false;
             let mut av_delay_changed = false;
+            let mut hotkey_changed = false;
 
             {
                 let mut guard = ctrl.borrow_mut();
@@ -521,6 +617,10 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                             c.fallback.live_audio_silence = false;
                             needs_rebuild = true;
                         }
+                    }
+                    ConfigPatch::Hotkey(hk) => {
+                        c.config.hotkey = hk;
+                        hotkey_changed = true;
                     }
                     ConfigPatch::VideoFormat(fmt) => {
                         if c.config.video != fmt {
@@ -567,6 +667,9 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                 }
                 if av_delay_changed && let Some(ref pipe) = c.pipeline {
                     pipe.set_av_delay_ms(c.config.av_delay_ms);
+                }
+                if hotkey_changed {
+                    c.sync_hotkey();
                 }
                 c.sync_window();
             }
@@ -621,6 +724,8 @@ fn shutdown_controller(ctrl: &Rc<RefCell<AppController>>) {
         if let Some(server) = c.ipc_server.take() {
             server.shutdown();
         }
+        let _ = c.hotkey_manager.apply(None);
+        c.overlay.take();
         c.window.take();
         c.hold.take();
         c.app.clone()
@@ -722,12 +827,16 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
             mic_init_warning,
             pipeline: None,
             ipc_server: Some(ipc_server),
+            hotkey_manager: HotkeyManager::new(!test_sources),
+            hotkey_error: None,
             window: None,
+            overlay: None,
             save_timer: None,
             timecode_timer: None,
             shutting_down: false,
         };
         ctrl_inner.hydrate_default_devices();
+        ctrl_inner.sync_hotkey();
 
         let ctrl = Rc::new(RefCell::new(ctrl_inner));
         *slot_activate.borrow_mut() = Some(Rc::clone(&ctrl));
@@ -743,37 +852,46 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
             }
         });
 
-        // Poll MP4 playback timecode at 250ms only while GUI is visible.
+        // Poll MP4 timecode and overlay frame similarity only while a window is visible.
         let weak_tc = Rc::downgrade(&ctrl);
-        let tc_id = glib::timeout_add_local(Duration::from_millis(250), move || {
+        let tc_id = glib::timeout_add_local(Duration::from_millis(150), move || {
             let Some(ctrl_rc) = weak_tc.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             let mut c = ctrl_rc.borrow_mut();
-            let visible = c.window.as_ref().is_some_and(MainWindow::is_visible);
-            if !visible {
+            let main_visible = c.window.as_ref().is_some_and(MainWindow::is_visible);
+            let overlay_visible = c.overlay.as_ref().is_some_and(OverlayWindow::is_visible);
+            if !main_visible && !overlay_visible {
                 return glib::ControlFlow::Continue;
             }
-            if let Some((pos_ms, dur_ms)) = c
-                .pipeline
-                .as_ref()
-                .and_then(MediaPipeline::loop_position_ms)
-            {
-                c.state.loop_pos_ms = pos_ms;
-                c.state.loop_dur_ms = dur_ms;
+            if main_visible {
+                if let Some((pos_ms, dur_ms)) = c
+                    .pipeline
+                    .as_ref()
+                    .and_then(MediaPipeline::loop_position_ms)
+                {
+                    c.state.loop_pos_ms = pos_ms;
+                    c.state.loop_dur_ms = dur_ms;
+                }
+                let fname = c
+                    .config
+                    .loop_file
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Нет MP4".into());
+                let pos = c.state.loop_pos_ms;
+                let dur = c.state.loop_dur_ms;
+                let fps = c.config.video.fps;
+                if let Some(ref win) = c.window {
+                    win.update_timecode(&fname, pos, dur, fps);
+                }
             }
-            let fname = c
-                .config
-                .loop_file
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Нет MP4".into());
-            let pos = c.state.loop_pos_ms;
-            let dur = c.state.loop_dur_ms;
-            let fps = c.config.video.fps;
-            if let Some(ref win) = c.window {
-                win.update_timecode(&fname, pos, dur, fps);
+            if overlay_visible
+                && let Some(ref ov) = c.overlay
+                && let Some(ref pipe) = c.pipeline
+            {
+                ov.set_similarity(pipe.similarity());
             }
             glib::ControlFlow::Continue
         });

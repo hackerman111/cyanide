@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod similarity;
 pub mod video;
 
 use std::cell::RefCell;
@@ -127,6 +128,7 @@ impl MediaPipeline {
         )?);
 
         video.select(state.mode.video());
+        video.matcher.set_frozen(state.frozen_reference);
         let (lg, rg) = state.target_gains(cfg);
         audio.set_gains(lg, rg);
         apply_av_delay(&video, &audio, cfg.av_delay_ms);
@@ -216,6 +218,14 @@ impl MediaPipeline {
 
     pub fn set_previews_active(&self, active: bool) {
         self.video.set_previews_active(active);
+    }
+
+    pub fn similarity(&self) -> f32 {
+        self.video.matcher.score()
+    }
+
+    pub fn set_reference_frozen(&self, frozen: bool) {
+        self.video.matcher.set_frozen(frozen);
     }
 
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {

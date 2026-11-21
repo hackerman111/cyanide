@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use gtk4::gdk;
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -8,6 +10,7 @@ use libadwaita::prelude::*;
 use crate::config::{Config, LoopReturnPolicy, StartupMode, VideoFormat};
 use crate::devices::DeviceInventory;
 use crate::gui::{ConfigPatch, UiAction};
+use crate::hotkey::Hotkey;
 use crate::state::{
     AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource,
 };
@@ -33,6 +36,8 @@ pub struct ControlPanel {
     audio_combo: adw::ComboRow,
     mic_switch: adw::SwitchRow,
     startup_combo: adw::ComboRow,
+    hotkey_row: adw::ActionRow,
+    hotkey_entry: gtk4::Entry,
     loop_file_row: adw::ActionRow,
     real_cam_combo: adw::ComboRow,
     virt_cam_combo: adw::ComboRow,
@@ -196,6 +201,108 @@ impl ControlPanel {
             });
         }
         routing_group.add(&startup_combo);
+
+        let hotkey_row = adw::ActionRow::builder()
+            .title("Системный хоткей")
+            .subtitle("Переключение Loop ↔ Live")
+            .build();
+        let hotkey_entry = gtk4::Entry::builder()
+            .placeholder_text("SUPER+F8")
+            .width_chars(12)
+            .valign(gtk4::Align::Center)
+            .build();
+        let record_btn = gtk4::ToggleButton::with_label("Записать");
+        record_btn.set_valign(gtk4::Align::Center);
+        let clear_hk_btn = gtk4::Button::from_icon_name("edit-clear-symbolic");
+        clear_hk_btn.set_valign(gtk4::Align::Center);
+        clear_hk_btn.set_tooltip_text(Some("Убрать системный хоткей"));
+
+        let recording = Rc::new(Cell::new(false));
+        {
+            let act = Rc::clone(&on_action);
+            let row_ref = hotkey_row.clone();
+            hotkey_entry.connect_activate(move |entry| {
+                let raw = entry.text();
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
+                    return;
+                }
+                match Hotkey::parse(trimmed) {
+                    Ok(hk) => {
+                        let canon = hk.canonical();
+                        entry.set_text(&canon);
+                        act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
+                    }
+                    Err(err) => {
+                        row_ref.set_subtitle(&err);
+                    }
+                }
+            });
+        }
+        {
+            let rec = Rc::clone(&recording);
+            let act = Rc::clone(&on_action);
+            record_btn.connect_toggled(move |b| {
+                let active = b.is_active();
+                rec.set(active);
+                b.set_label(if active {
+                    "Нажмите…"
+                } else {
+                    "Записать"
+                });
+                act(UiAction::SetHotkeyCapture(active));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let entry = hotkey_entry.clone();
+            let rec_btn = record_btn.clone();
+            clear_hk_btn.connect_clicked(move |_| {
+                if rec_btn.is_active() {
+                    rec_btn.set_active(false);
+                }
+                entry.set_text("");
+                act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
+            });
+        }
+
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let rec = Rc::clone(&recording);
+            let rec_btn = record_btn.clone();
+            let entry = hotkey_entry.clone();
+            let act = Rc::clone(&on_action);
+            key_ctrl.connect_key_pressed(move |_, key, _, state| {
+                if !rec.get() {
+                    return glib::Propagation::Proceed;
+                }
+                if key == gdk::Key::Escape {
+                    rec_btn.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                if let Some(hk) = Hotkey::from_gdk(key, state) {
+                    let canon = hk.canonical();
+                    rec.set(false);
+                    entry.set_text(&canon);
+                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
+                    rec_btn.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Stop
+            });
+        }
+        window.add_controller(key_ctrl);
+
+        let hk_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        hk_box.set_valign(gtk4::Align::Center);
+        hk_box.append(&hotkey_entry);
+        hk_box.append(&record_btn);
+        hk_box.append(&clear_hk_btn);
+        hotkey_row.add_suffix(&hk_box);
+        routing_group.add(&hotkey_row);
+
         content.append(&routing_group);
 
         // --- Group 2: Sources & Format ---
@@ -486,6 +593,8 @@ impl ControlPanel {
             audio_combo,
             mic_switch,
             startup_combo,
+            hotkey_row,
+            hotkey_entry,
             loop_file_row,
             real_cam_combo,
             virt_cam_combo,
@@ -509,7 +618,13 @@ impl ControlPanel {
         }
     }
 
-    pub fn sync_state(&self, cfg: &Config, state: &AppState, devices: &DeviceInventory) {
+    pub fn sync_state(
+        &self,
+        cfg: &Config,
+        state: &AppState,
+        devices: &DeviceInventory,
+        hotkey_error: Option<&str>,
+    ) {
         let prev = self.syncing.replace(true);
 
         match state.mode.video() {
@@ -528,6 +643,17 @@ impl ControlPanel {
             StartupMode::Live => 0,
             StartupMode::Loop => 1,
         });
+
+        let hk_text = cfg.hotkey.as_deref().unwrap_or("");
+        if !self.hotkey_entry.has_focus() && self.hotkey_entry.text().as_str() != hk_text {
+            self.hotkey_entry.set_text(hk_text);
+        }
+        let hk_subtitle = match hotkey_error {
+            Some(err) => err,
+            None if cfg.hotkey.is_some() => "Активен для Loop ↔ Live",
+            None => "Нажмите «Записать» или введите, напр. SUPER+F8",
+        };
+        self.hotkey_row.set_subtitle(hk_subtitle);
 
         let file_label = cfg
             .loop_file
