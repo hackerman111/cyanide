@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cyanide
+GenericName=VirtualCam & VirtualMic Studio
+Comment=Virtual camera and virtual microphone studio for Linux
+Exec=cyanide %U
+Icon=io.github.cyanide.VirtualCam
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+StartupNotify=true

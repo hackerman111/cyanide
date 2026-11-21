@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+set -eu
+
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export APPDIR="$HERE"
+export PATH="${HERE}/usr/bin:${PATH}"
+
+if [ -d "${HERE}/usr/lib" ]; then
+    export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+if [ -d "${HERE}/usr/lib/gstreamer-1.0" ]; then
+    export GST_PLUGIN_PATH_1_0="${HERE}/usr/lib/gstreamer-1.0${GST_PLUGIN_PATH_1_0:+:${GST_PLUGIN_PATH_1_0}}"
+fi
+
+export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+exec "${HERE}/usr/bin/cyanide" "$@"
