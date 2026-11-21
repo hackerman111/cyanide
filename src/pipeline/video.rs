@@ -94,6 +94,8 @@ impl VideoBranch {
             .field("width", cfg.video.width as i32)
             .field("height", cfg.video.height as i32)
             .field("framerate", gst::Fraction::new(cfg.video.fps as i32, 1))
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .field("interlace-mode", "progressive")
             .build();
         let out_caps = make_capsfilter("out_v4l2_caps", &yuy2_caps)?;
 
@@ -249,6 +251,7 @@ fn build_loop_branch(
     let src_pad = sel_queue
         .static_pad("src")
         .ok_or_else(|| PipelineError::Link("loop_sel_queue missing src pad".into()))?;
+    install_selector_caps_normalizer(&src_pad);
     src_pad
         .link(sel_pad)
         .map_err(|e| PipelineError::Link(format!("loop -> video_sel: {e}")))?;
@@ -425,6 +428,7 @@ fn build_live_branch(
     let src_pad = sel_queue
         .static_pad("src")
         .ok_or_else(|| PipelineError::Link("live_sel_queue missing src pad".into()))?;
+    install_selector_caps_normalizer(&src_pad);
     src_pad
         .link(sel_pad)
         .map_err(|e| PipelineError::Link(format!("live -> video_sel: {e}")))?;
@@ -511,6 +515,9 @@ fn build_virtual_cam_sink(
         sink.set_property("device", dev);
         sink.set_property("sync", false);
         sink.set_property("async", false);
+        // Prevent GstBaseSink::last-sample from pinning an MMAP buffer from v4l2bufferpool,
+        // which otherwise blocks REQBUFS(0) and causes v4l2loopback S_FMT to return EBUSY.
+        sink.set_property("enable-last-sample", false);
         return Ok((sink, None));
     }
 
@@ -527,11 +534,46 @@ fn build_virtual_cam_sink(
 }
 
 fn common_video_caps(width: u32, height: u32, fps: u32) -> gst::Caps {
+    // Pin format/PAR/interlace/colorimetry identically on both branches so switching
+    // input-selector never renegotiates v4l2sink, and I420 -> YUY2 prevents videoconvert
+    // passthrough from forwarding unsupported camera colorimetry to v4l2loopback.
     gst::Caps::builder("video/x-raw")
+        .field("format", "I420")
         .field("width", width as i32)
         .field("height", height as i32)
         .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+        .field("interlace-mode", "progressive")
+        .field("colorimetry", "bt709")
         .build()
+}
+
+fn strip_optional_caps_fields(caps: &gst::CapsRef) -> Option<gst::Caps> {
+    const STRIP_FIELDS: &[&str] = &["multiview-mode", "multiview-flags", "chroma-site"];
+    let s = caps.structure(0)?;
+    if !STRIP_FIELDS.iter().any(|&f| s.has_field(f)) {
+        return None;
+    }
+    let mut owned = caps.to_owned();
+    if let Some(ms) = owned.make_mut().structure_mut(0) {
+        ms.remove_fields(STRIP_FIELDS.iter().copied());
+    }
+    Some(owned)
+}
+
+fn install_selector_caps_normalizer(src_pad: &gst::Pad) {
+    src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_pad, info| {
+        if let Some(gst::PadProbeData::Event(ref ev)) = info.data
+            && let gst::EventView::Caps(caps_ev) = ev.view()
+            && let Some(normalized) = strip_optional_caps_fields(caps_ev.caps())
+        {
+            let new_ev = gst::event::Caps::builder(&normalized)
+                .seqnum(ev.seqnum())
+                .build();
+            info.data = Some(gst::PadProbeData::Event(new_ev));
+        }
+        gst::PadProbeReturn::Ok
+    });
 }
 
 fn path_to_uri(path: &Path) -> Result<String, PipelineError> {
@@ -622,5 +664,30 @@ mod tests {
         // Subsequent non-flushing SegmentDone segment (same seek gen) stays untouched.
         assert!(rebaser.rebase_if_needed(&video_gen, &raw_seg).is_none());
         assert!(rebaser.rebase_if_needed(&audio_gen, &raw_seg).is_none());
+    }
+
+    #[test]
+    fn common_caps_and_normalizer_produce_identical_selector_caps() {
+        gst::init().unwrap();
+        let canonical = common_video_caps(1280, 720, 30);
+        let s = canonical.structure(0).unwrap();
+        assert_eq!(s.get::<&str>("format").unwrap(), "I420");
+        assert_eq!(
+            s.get::<gst::Fraction>("pixel-aspect-ratio").unwrap(),
+            gst::Fraction::new(1, 1)
+        );
+        assert_eq!(s.get::<&str>("interlace-mode").unwrap(), "progressive");
+        assert_eq!(s.get::<&str>("colorimetry").unwrap(), "bt709");
+
+        // No-op when optional metadata fields are absent.
+        assert!(strip_optional_caps_fields(&canonical).is_none());
+
+        // Decoder-added multiview/chroma metadata is stripped so both input-selector pads match.
+        let mut with_meta = canonical.clone();
+        let ms = with_meta.make_mut().structure_mut(0).unwrap();
+        ms.set("multiview-mode", "mono");
+        ms.set("chroma-site", "mpeg2");
+        let stripped = strip_optional_caps_fields(&with_meta).expect("metadata must be stripped");
+        assert!(stripped.is_equal_fixed(&canonical));
     }
 }
