@@ -9,6 +9,8 @@ use gstreamer_video as gst_video;
 use crate::config::Config;
 use crate::devices::modprobe_hint;
 use crate::pipeline::audio::AudioBranch;
+use crate::pipeline::lag::LagController;
+use crate::pipeline::record::VideoRecorder;
 use crate::pipeline::similarity::{FrameMatcher, FrameSide};
 use crate::pipeline::{ForceFallback, PipelineError, PreviewBackend, PreviewObjects};
 use crate::state::VideoSource;
@@ -26,7 +28,11 @@ pub struct VideoBranch {
     pub out_valve: gst::Element,
     pub previews: PreviewObjects,
     pub matcher: Arc<FrameMatcher>,
+    pub lag: Arc<LagController>,
+    pub recorder: Arc<VideoRecorder>,
     pub rebaser: Arc<SegmentRebaser>,
+    pub ping_pong: AtomicBool,
+    loop_reversed: AtomicBool,
     pub loop_warning: Option<String>,
     pub live_warning: Option<String>,
     pub output_warning: Option<String>,
@@ -68,6 +74,8 @@ impl VideoBranch {
             &rebaser,
         )?;
 
+        let recorder = Arc::new(VideoRecorder::new());
+
         let (live_valve, live_sink, live_warning) = build_live_branch(
             pipeline,
             cfg,
@@ -76,6 +84,7 @@ impl VideoBranch {
             test_sources,
             fallback.live_video_black,
             &live_sel_pad,
+            &recorder,
         )?;
 
         let out_queue = make_element("queue", Some("video_out_queue"))?;
@@ -132,6 +141,9 @@ impl VideoBranch {
         attach_similarity_probe(&loop_valve, FrameSide::Loop, Arc::clone(&matcher));
         attach_similarity_probe(&live_valve, FrameSide::Live, Arc::clone(&matcher));
 
+        let lag = Arc::new(LagController::new(cfg.lag));
+        attach_lag_probe(&out_clocksync, Arc::clone(&lag));
+
         Ok(Self {
             selector,
             loop_sel_pad,
@@ -147,7 +159,11 @@ impl VideoBranch {
                 out_sink,
             },
             matcher,
+            lag,
+            recorder,
             rebaser,
+            ping_pong: AtomicBool::new(cfg.loop_ping_pong),
+            loop_reversed: AtomicBool::new(false),
             loop_warning,
             live_warning,
             output_warning,
@@ -182,13 +198,51 @@ impl VideoBranch {
         self.out_valve.set_property("drop", drop_frames);
     }
 
+    pub fn set_ping_pong(&self, enabled: bool) {
+        self.ping_pong.store(enabled, Ordering::Release);
+    }
+
+    pub fn is_loop_reversed(&self) -> bool {
+        self.loop_reversed.load(Ordering::Acquire)
+    }
+
     pub fn seek_loop(&self, pipeline: &gst::Pipeline, position_ms: u64, flushing: bool) -> bool {
+        self.loop_reversed.store(false, Ordering::Release);
+        self.seek_loop_segment(pipeline, false, Some(position_ms), flushing)
+    }
+
+    /// Advances the loop video at a segment boundary (SegmentDone / EOS).
+    /// When ping-pong is enabled, alternates +1.0 (forward) and -1.0 (reverse).
+    pub fn advance_loop_segment(&self, pipeline: &gst::Pipeline, flushing: bool) -> bool {
+        if !self.ping_pong.load(Ordering::Acquire) {
+            self.loop_reversed.store(false, Ordering::Release);
+            return self.seek_loop_segment(pipeline, false, Some(0), flushing);
+        }
+
+        let next_reversed = !self.loop_reversed.load(Ordering::Acquire);
+        if self.seek_loop_segment(pipeline, next_reversed, None, flushing) {
+            self.loop_reversed.store(next_reversed, Ordering::Release);
+            true
+        } else {
+            // Fall back to forward restart if the file/decoder rejects negative-rate seeking.
+            self.loop_reversed.store(false, Ordering::Release);
+            self.seek_loop_segment(pipeline, false, Some(0), flushing)
+        }
+    }
+
+    fn seek_loop_segment(
+        &self,
+        pipeline: &gst::Pipeline,
+        reversed: bool,
+        start_ms: Option<u64>,
+        flushing: bool,
+    ) -> bool {
         let Some(ref src) = self.loop_source else {
             return false;
         };
         if flushing {
             // Rebase post-seek GstSegment.base to the live pipeline running_time so
-            // audiomixer and clocksync do not drop frames/audio after Restart/Bookmark seeks.
+            // audiomixer and clocksync do not drop frames/audio after Restart/Bookmark/reverse seeks.
             let rt_ns = pipeline
                 .current_running_time()
                 .map_or(0, gst::ClockTime::nseconds);
@@ -198,15 +252,33 @@ impl VideoBranch {
         if flushing {
             flags |= gst::SeekFlags::FLUSH;
         }
-        src.seek(
-            1.0,
-            flags,
-            gst::SeekType::Set,
-            gst::ClockTime::from_mseconds(position_ms),
-            gst::SeekType::None,
-            gst::ClockTime::NONE,
-        )
-        .is_ok()
+        if reversed {
+            let stop = src.query_duration::<gst::ClockTime>();
+            let (stop_type, stop_pos) = match stop {
+                Some(dur) if dur > gst::ClockTime::ZERO => (gst::SeekType::Set, Some(dur)),
+                _ => (gst::SeekType::None, gst::ClockTime::NONE),
+            };
+            src.seek(
+                -1.0,
+                flags,
+                gst::SeekType::Set,
+                gst::ClockTime::ZERO,
+                stop_type,
+                stop_pos,
+            )
+            .is_ok()
+        } else {
+            let pos = start_ms.unwrap_or(0);
+            src.seek(
+                1.0,
+                flags,
+                gst::SeekType::Set,
+                gst::ClockTime::from_mseconds(pos),
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .is_ok()
+        }
     }
 
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {
@@ -275,7 +347,6 @@ fn build_loop_branch(
     });
 
     if !force_black
-        && !test_sources
         && let Some(path) = cfg.loop_file.as_deref()
         && path.exists()
         && let Ok(uri) = path_to_uri(path)
@@ -284,38 +355,74 @@ fn build_loop_branch(
         decodebin.set_property("uri", uri.as_str());
         pipeline.add(&decodebin)?;
 
-        // Rebase segment base on flushing seeks and trap upstream demuxer EOS before it stalls.
+        // Rebase segment base on flushing seeks, normalize reverse ping-pong segments into
+        // forward PTS for videorate/clocksync, and trap upstream demuxer EOS before it stalls.
         if let Some(q_src) = queue.static_pad("src") {
             let reb = Arc::clone(rebaser);
             let seen_gen = AtomicU64::new(0);
             let weak_pipe = pipeline.downgrade();
-            q_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
-                    match ev.view() {
-                        gst::EventView::Segment(seg_ev) => {
-                            if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
-                                && let Some(rebased) = reb.rebase_if_needed(&seen_gen, seg)
+            let rev_seg: Mutex<Option<gst::FormattedSegment<gst::ClockTime>>> = Mutex::new(None);
+            q_src.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_pad, info| {
+                    match info.data {
+                        Some(gst::PadProbeData::Event(ref ev)) => match ev.view() {
+                            gst::EventView::Segment(seg_ev) => {
+                                if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+                                {
+                                    let rebased = reb.rebase_if_needed(&seen_gen, seg);
+                                    let effective = rebased.as_ref().unwrap_or(seg);
+                                    if effective.rate() < 0.0 {
+                                        if let Ok(mut guard) = rev_seg.lock() {
+                                            *guard = Some(effective.clone());
+                                        }
+                                        let fwd = normalize_reverse_segment(effective);
+                                        let new_ev = gst::event::Segment::builder(&fwd)
+                                            .seqnum(ev.seqnum())
+                                            .build();
+                                        info.data = Some(gst::PadProbeData::Event(new_ev));
+                                    } else {
+                                        if let Ok(mut guard) = rev_seg.lock() {
+                                            *guard = None;
+                                        }
+                                        if let Some(rebased) = rebased {
+                                            let new_ev = gst::event::Segment::builder(&rebased)
+                                                .seqnum(ev.seqnum())
+                                                .build();
+                                            info.data = Some(gst::PadProbeData::Event(new_ev));
+                                        }
+                                    }
+                                }
+                            }
+                            gst::EventView::Eos(_) => {
+                                if let Some(p) = weak_pipe.upgrade() {
+                                    let msg = gst::message::Application::new(
+                                        gst::Structure::new_empty(LOOP_EOS_MSG),
+                                    );
+                                    let _ = p.post_message(msg);
+                                }
+                                return gst::PadProbeReturn::Drop;
+                            }
+                            _ => {}
+                        },
+                        Some(gst::PadProbeData::Buffer(ref mut buf)) => {
+                            if let Ok(guard) = rev_seg.lock()
+                                && let Some(ref rseg) = *guard
+                                && let Some(pts) = buf.pts()
+                                && let Some(rt) = rseg.to_running_time(pts)
                             {
-                                let new_ev = gst::event::Segment::builder(&rebased)
-                                    .seqnum(ev.seqnum())
-                                    .build();
-                                info.data = Some(gst::PadProbeData::Event(new_ev));
+                                let base = rseg.base().unwrap_or(gst::ClockTime::ZERO);
+                                let norm_pts = rt.saturating_sub(base);
+                                let buf_mut = buf.make_mut();
+                                buf_mut.set_pts(norm_pts);
+                                buf_mut.set_dts(gst::ClockTime::NONE);
                             }
-                        }
-                        gst::EventView::Eos(_) => {
-                            if let Some(p) = weak_pipe.upgrade() {
-                                let msg = gst::message::Application::new(
-                                    gst::Structure::new_empty(LOOP_EOS_MSG),
-                                );
-                                let _ = p.post_message(msg);
-                            }
-                            return gst::PadProbeReturn::Drop;
                         }
                         _ => {}
                     }
-                }
-                gst::PadProbeReturn::Ok
-            });
+                    gst::PadProbeReturn::Ok
+                },
+            );
         }
 
         let video_linked = Arc::new(AtomicBool::new(false));
@@ -377,6 +484,7 @@ fn build_live_branch(
     test_sources: bool,
     force_black: bool,
     sel_pad: &gst::Pad,
+    recorder: &Arc<VideoRecorder>,
 ) -> Result<(gst::Element, gst::Element, Option<String>), PipelineError> {
     let queue = make_element("queue", Some("live_video_queue"))?;
     let convert = make_element("videoconvert", Some("live_convert"))?;
@@ -442,6 +550,7 @@ fn build_live_branch(
         .map_err(|e| PipelineError::Link(format!("live -> video_sel: {e}")))?;
 
     let (valve, preview_sink) = attach_preview_leg(pipeline, &tee, "live", backend)?;
+    attach_record_probe(&caps, Arc::clone(recorder));
     Ok((valve, preview_sink, warning))
 }
 
@@ -516,6 +625,96 @@ fn attach_similarity_probe(valve: &gst::Element, side: FrameSide, matcher: Arc<F
                         if let Some(ref vinfo) = *guard {
                             matcher.on_buffer(side, vinfo, buf);
                         }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
+fn normalize_reverse_segment(
+    seg: &gst::FormattedSegment<gst::ClockTime>,
+) -> gst::FormattedSegment<gst::ClockTime> {
+    let base = seg.base().unwrap_or(gst::ClockTime::ZERO);
+    let start = seg.start().unwrap_or(gst::ClockTime::ZERO);
+    let duration = seg
+        .stop()
+        .and_then(|stop| stop.checked_sub(start))
+        .map(|d| {
+            let speed = seg.rate().abs();
+            if speed > 0.0 && (speed - 1.0).abs() > 1e-6 {
+                gst::ClockTime::from_nseconds((d.nseconds() as f64 / speed) as u64)
+            } else {
+                d
+            }
+        });
+    let mut fwd = gst::FormattedSegment::<gst::ClockTime>::new();
+    fwd.set_rate(1.0);
+    fwd.set_applied_rate(seg.applied_rate());
+    fwd.set_base(base);
+    fwd.set_start(gst::ClockTime::ZERO);
+    fwd.set_position(gst::ClockTime::ZERO);
+    fwd.set_time(gst::ClockTime::ZERO);
+    if let Some(dur) = duration {
+        fwd.set_stop(dur);
+    }
+    fwd
+}
+
+fn attach_record_probe(live_caps: &gst::Element, recorder: Arc<VideoRecorder>) {
+    let Some(src_pad) = live_caps.static_pad("src") else {
+        return;
+    };
+    let cached_caps: Mutex<Option<gst::Caps>> = Mutex::new(None);
+    src_pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |pad, info| {
+            match info.data {
+                Some(gst::PadProbeData::Event(ref ev)) => {
+                    if let gst::EventView::Caps(c) = ev.view()
+                        && let Ok(mut guard) = cached_caps.lock()
+                    {
+                        *guard = Some(c.caps().to_owned());
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(ref buf)) => {
+                    if !recorder.is_recording() {
+                        return gst::PadProbeReturn::Ok;
+                    }
+                    if let Ok(mut guard) = cached_caps.lock() {
+                        if guard.is_none() {
+                            *guard = pad.current_caps();
+                        }
+                        if let Some(ref caps) = *guard {
+                            recorder.push_buffer(buf, caps);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
+fn attach_lag_probe(out_clocksync: &gst::Element, lag: Arc<LagController>) {
+    let Some(src_pad) = out_clocksync.static_pad("src") else {
+        return;
+    };
+    src_pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| {
+            match info.data {
+                Some(gst::PadProbeData::Event(ref ev)) => {
+                    if matches!(ev.view(), gst::EventView::Caps(_)) {
+                        lag.clear_held();
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(ref buf)) => {
+                    if let Some(frozen) = lag.process_buffer(buf) {
+                        info.data = Some(gst::PadProbeData::Buffer(frozen));
                     }
                 }
                 _ => {}

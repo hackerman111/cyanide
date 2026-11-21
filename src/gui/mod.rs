@@ -12,12 +12,14 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::config::{
-    CompareConfig, CompareMode, Config, LoopReturnPolicy, StartupMode, VideoFormat,
+    CompareConfig, CompareMode, Config, LagConfig, LoopReturnPolicy, StartupMode, VideoFormat,
 };
 use crate::devices::DeviceInventory;
 use crate::gui::compare::CompareView;
 use crate::gui::controls::ControlPanel;
-use crate::state::{AppState, AudioLevels, AudioSource, Command, StreamMode, VideoSource};
+use crate::state::{
+    AppState, AudioLevels, AudioSource, Command, RecordAction, StreamMode, VideoSource,
+};
 
 #[derive(Debug, Clone)]
 pub enum ConfigPatch {
@@ -32,7 +34,9 @@ pub enum ConfigPatch {
     AvDelayMs(i32),
     CrossfadeMs(u32),
     LoopReturn(LoopReturnPolicy),
+    LoopPingPong(bool),
     Compare(CompareConfig),
+    Lag(LagConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +54,7 @@ pub struct MainWindow {
     window: adw::ApplicationWindow,
     status_pill: gtk4::Label,
     toggle_btn: gtk4::Button,
+    record_btn: gtk4::Button,
     overlay_btn: gtk4::ToggleButton,
     banner: adw::Banner,
     loop_info_label: gtk4::Label,
@@ -124,6 +129,16 @@ impl MainWindow {
             });
         }
         header.pack_end(&overlay_btn);
+
+        let record_btn = gtk4::Button::with_label("● Запись");
+        record_btn.set_tooltip_text(Some("Записать видео с камеры на лету в MP4"));
+        {
+            let act = Rc::clone(&on_action);
+            record_btn.connect_clicked(move |_| {
+                act(UiAction::Command(Command::Record(RecordAction::Toggle)))
+            });
+        }
+        header.pack_end(&record_btn);
 
         let banner = adw::Banner::new("");
         banner.set_revealed(false);
@@ -491,6 +506,7 @@ impl MainWindow {
             window,
             status_pill,
             toggle_btn,
+            record_btn,
             overlay_btn,
             banner,
             loop_info_label,
@@ -616,14 +632,50 @@ impl MainWindow {
         }
 
         self.controls.sync_state(cfg, state, devices, hotkey_error);
+        self.apply_recording_ui(
+            state.recording,
+            state.recording_saving,
+            state.recording_elapsed_ms,
+        );
         self.syncing.set(prev);
+    }
+
+    pub fn update_recording_timer(&self, recording: bool, saving: bool, elapsed_ms: u64) {
+        self.apply_recording_ui(recording, saving, elapsed_ms);
+    }
+
+    fn apply_recording_ui(&self, recording: bool, saving: bool, elapsed_ms: u64) {
+        if saving {
+            self.record_btn.set_label("Сохранение…");
+            self.record_btn.set_sensitive(false);
+            self.record_btn.remove_css_class("destructive-action");
+        } else if recording {
+            let secs = elapsed_ms / 1000;
+            self.record_btn
+                .set_label(&format!("■ Стоп {:02}:{:02}", secs / 60, secs % 60));
+            self.record_btn.set_sensitive(true);
+            self.record_btn.add_css_class("destructive-action");
+        } else {
+            self.record_btn.set_label("● Запись");
+            self.record_btn.set_sensitive(true);
+            self.record_btn.remove_css_class("destructive-action");
+        }
+        self.controls
+            .update_recording_ui(recording, saving, elapsed_ms);
     }
 
     pub fn update_levels(&self, levels: &AudioLevels) {
         self.controls.update_levels(levels);
     }
 
-    pub fn update_timecode(&self, file_name: &str, pos_ms: u64, dur_ms: Option<u64>, fps: u32) {
+    pub fn update_timecode(
+        &self,
+        file_name: &str,
+        pos_ms: u64,
+        dur_ms: Option<u64>,
+        fps: u32,
+        reversed: bool,
+    ) {
         let pos_s = pos_ms / 1000;
         let dur_str = dur_ms
             .map(|d| {
@@ -631,11 +683,13 @@ impl MainWindow {
                 format!("{:02}:{:02}", s / 60, s % 60)
             })
             .unwrap_or_else(|| "--:--".into());
+        let dir = if reversed { " ◀" } else { "" };
         self.loop_info_label.set_label(&format!(
-            "{} · {:02}:{:02} / {} · {} FPS",
+            "{} · {:02}:{:02}{} / {} · {} FPS",
             file_name,
             pos_s / 60,
             pos_s % 60,
+            dir,
             dur_str,
             fps
         ));

@@ -227,31 +227,49 @@ impl AudioBranch {
         }
 
         // Rebase segment base after flushing seeks so audiomixer never drops post-seek audio,
+        // drop audio during reverse ping-pong passes (silence_baseline keeps audiomixer ticking),
         // and drop upstream EOS so audiomixer keeps the loop pad open across restarts.
         if let Some(src_pad) = self.loop_input_queue.static_pad("src") {
             let rebaser = Arc::clone(&self.rebaser);
             let seen_gen = AtomicU64::new(0);
-            src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
-                    match ev.view() {
-                        gst::EventView::Segment(seg_ev) => {
-                            if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
-                                && let Some(rebased) = rebaser.rebase_if_needed(&seen_gen, seg)
-                            {
-                                let new_ev = gst::event::Segment::builder(&rebased)
-                                    .seqnum(ev.seqnum())
-                                    .build();
-                                info.data = Some(gst::PadProbeData::Event(new_ev));
+            let in_reverse = AtomicBool::new(false);
+            src_pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_pad, info| {
+                    match info.data {
+                        Some(gst::PadProbeData::Event(ref ev)) => match ev.view() {
+                            gst::EventView::Segment(seg_ev) => {
+                                if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+                                {
+                                    if seg.rate() < 0.0 {
+                                        in_reverse.store(true, Ordering::Relaxed);
+                                        return gst::PadProbeReturn::Drop;
+                                    }
+                                    in_reverse.store(false, Ordering::Relaxed);
+                                    if let Some(rebased) = rebaser.rebase_if_needed(&seen_gen, seg)
+                                    {
+                                        let new_ev = gst::event::Segment::builder(&rebased)
+                                            .seqnum(ev.seqnum())
+                                            .build();
+                                        info.data = Some(gst::PadProbeData::Event(new_ev));
+                                    }
+                                }
                             }
-                        }
-                        gst::EventView::Eos(_) => {
+                            gst::EventView::Eos(_) => {
+                                return gst::PadProbeReturn::Drop;
+                            }
+                            _ => {}
+                        },
+                        Some(gst::PadProbeData::Buffer(_))
+                            if in_reverse.load(Ordering::Relaxed) =>
+                        {
                             return gst::PadProbeReturn::Drop;
                         }
                         _ => {}
                     }
-                }
-                gst::PadProbeReturn::Ok
-            });
+                    gst::PadProbeReturn::Ok
+                },
+            );
         }
 
         for el in &added {
@@ -329,8 +347,8 @@ fn build_live_audio_source(
         return Ok((src, None));
     }
 
-    // Never bind unconstrained pulsesrc (@DEFAULT_SOURCE@): if VirtualCamMic or a monitor
-    // is the system default source, that would create an audio feedback loop.
+    // Never bind unconstrained pulsesrc (@DEFAULT_SOURCE@): real_mic is None by default
+    // so original microphone audio is not passed through unless explicitly selected.
     let Some(dev) = cfg
         .real_mic
         .as_deref()
@@ -340,13 +358,7 @@ fn build_live_audio_source(
         let src = make_element("audiotestsrc", Some("live_audio_fallback"))?;
         src.set_property_from_str("wave", "silence");
         src.set_property("is-live", true);
-        return Ok((
-            src,
-            Some(
-                "Реальный микрофон не выбран — используется тишина (защита от обратной связи)"
-                    .into(),
-            ),
-        ));
+        return Ok((src, None));
     };
 
     if gst::ElementFactory::find("pulsesrc").is_none() {
@@ -495,12 +507,10 @@ mod tests {
         )
         .unwrap();
         assert!(pipeline.by_name("live_mic_src").is_none());
+        assert!(pipeline.by_name("live_audio_fallback").is_some());
         assert!(
-            branch
-                .live_warning
-                .as_deref()
-                .is_some_and(|w| w.contains("микрофон") && w.contains("тишина")),
-            "expected explicit no-mic silence warning, got {:?}",
+            branch.live_warning.is_none(),
+            "intentional disabled real_mic should not emit a warning banner, got {:?}",
             branch.live_warning
         );
     }

@@ -55,6 +55,14 @@ pub enum MicAction {
     Toggle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordAction {
+    Start,
+    Stop,
+    Toggle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
@@ -63,6 +71,7 @@ pub enum Command {
     SetVideo(VideoSource),
     SetAudio(AudioSource),
     SetMic(MicAction),
+    Record(RecordAction),
     SetFreeze { frozen: bool },
     Show,
     Hide,
@@ -101,6 +110,7 @@ pub struct StatusSnapshot {
     pub audio: AudioSource,
     pub virtual_mic_enabled: bool,
     pub frozen_reference: bool,
+    pub recording: bool,
     pub startup_mode: StartupMode,
     pub av_delay_ms: i32,
     pub health: SourceHealth,
@@ -126,6 +136,9 @@ pub struct AppState {
     pub mode: StreamMode,
     pub virtual_mic_enabled: bool,
     pub frozen_reference: bool,
+    pub recording: bool,
+    pub recording_saving: bool,
+    pub recording_elapsed_ms: u64,
     pub levels: AudioLevels,
     pub health: SourceHealth,
     pub loop_pos_ms: u64,
@@ -142,6 +155,9 @@ impl AppState {
             mode,
             virtual_mic_enabled: true,
             frozen_reference: false,
+            recording: false,
+            recording_saving: false,
+            recording_elapsed_ms: 0,
             levels: AudioLevels::default(),
             health: SourceHealth::default(),
             loop_pos_ms: 0,
@@ -179,7 +195,11 @@ impl AppState {
                 };
             }
             Command::SetFreeze { frozen } => self.frozen_reference = frozen,
-            Command::Show | Command::Hide | Command::Status | Command::Quit => {}
+            Command::Record(_)
+            | Command::Show
+            | Command::Hide
+            | Command::Status
+            | Command::Quit => {}
         }
 
         let next_video = self.mode.video();
@@ -213,6 +233,7 @@ impl AppState {
             audio: self.mode.audio(),
             virtual_mic_enabled: self.virtual_mic_enabled,
             frozen_reference: self.frozen_reference,
+            recording: self.recording,
             startup_mode: cfg.startup_mode,
             av_delay_ms: cfg.av_delay_ms,
             health: self.health.clone(),

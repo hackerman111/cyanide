@@ -94,6 +94,37 @@ pub enum LoopReturnPolicy {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LagConfig {
+    pub enabled: bool,
+    pub freeze_on_switch: bool,
+    pub interval_ms: u32,
+    pub min_duration_ms: u32,
+    pub max_duration_ms: u32,
+}
+
+impl Default for LagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            freeze_on_switch: false,
+            interval_ms: 3000,
+            min_duration_ms: 100,
+            max_duration_ms: 500,
+        }
+    }
+}
+
+impl LagConfig {
+    pub fn sanitized(mut self) -> Self {
+        self.interval_ms = self.interval_ms.clamp(500, 15_000);
+        self.min_duration_ms = self.min_duration_ms.clamp(100, 5_000);
+        self.max_duration_ms = self.max_duration_ms.clamp(self.min_duration_ms, 5_000);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -109,7 +140,9 @@ pub struct Config {
     pub crossfade_ms: u32,
     pub video: VideoFormat,
     pub loop_return: LoopReturnPolicy,
+    pub loop_ping_pong: bool,
     pub compare: CompareConfig,
+    pub lag: LagConfig,
 }
 
 impl Default for Config {
@@ -127,7 +160,9 @@ impl Default for Config {
             crossfade_ms: 20,
             video: VideoFormat::default(),
             loop_return: LoopReturnPolicy::Continue,
+            loop_ping_pong: false,
             compare: CompareConfig::default(),
+            lag: LagConfig::default(),
         }
     }
 }
@@ -168,6 +203,7 @@ impl Config {
             .as_deref()
             .and_then(|s| crate::hotkey::Hotkey::parse(s).ok())
             .map(|h| h.canonical());
+        self.lag = self.lag.sanitized();
         self
     }
 
@@ -224,6 +260,12 @@ mod tests {
         assert_eq!(cfg.video.fps, 30);
         assert_eq!(cfg.crossfade_ms, 20);
         assert_eq!(cfg.av_delay_ms, 0);
+        assert_eq!(cfg.real_mic, None);
+        assert!(!cfg.loop_ping_pong);
+        assert!(!cfg.lag.enabled);
+        assert!(!cfg.lag.freeze_on_switch);
+        assert_eq!(cfg.lag.min_duration_ms, 100);
+        assert_eq!(cfg.lag.max_duration_ms, 500);
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let decoded: Config = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, cfg);
@@ -247,6 +289,13 @@ mod tests {
             },
             real_mic: Some("VirtualCamMic".into()),
             hotkey: Some("shift+super+f8".into()),
+            lag: LagConfig {
+                enabled: true,
+                freeze_on_switch: true,
+                interval_ms: 10,
+                min_duration_ms: 2000,
+                max_duration_ms: 500,
+            },
             ..Default::default()
         };
         let clean = cfg.sanitized();
@@ -259,6 +308,9 @@ mod tests {
         assert_eq!(clean.video.fps, 30);
         assert_eq!(clean.real_mic, None);
         assert_eq!(clean.hotkey.as_deref(), Some("SUPER+SHIFT+F8"));
+        assert_eq!(clean.lag.interval_ms, 500);
+        assert_eq!(clean.lag.min_duration_ms, 2000);
+        assert_eq!(clean.lag.max_duration_ms, 2000);
     }
 
     #[test]

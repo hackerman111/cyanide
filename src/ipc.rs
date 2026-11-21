@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as Tokio
 use tokio::net::UnixListener;
 use tokio::sync::{oneshot, watch};
 
-use crate::state::{AudioSource, Command, MicAction, Reply, StreamMode, VideoSource};
+use crate::state::{AudioSource, Command, MicAction, RecordAction, Reply, StreamMode, VideoSource};
 
 const MAX_COMMAND_LINE_BYTES: u64 = 8192;
 
@@ -163,6 +163,9 @@ pub fn parse_command_line(line: &str) -> Result<Command, String> {
         ("mic", Some("on")) => Ok(Command::SetMic(MicAction::On)),
         ("mic", Some("off")) => Ok(Command::SetMic(MicAction::Off)),
         ("mic", Some("toggle")) => Ok(Command::SetMic(MicAction::Toggle)),
+        ("record", Some("start")) => Ok(Command::Record(RecordAction::Start)),
+        ("record", Some("stop")) => Ok(Command::Record(RecordAction::Stop)),
+        ("record", Some("toggle")) => Ok(Command::Record(RecordAction::Toggle)),
         _ => Err(format!("unknown command '{trimmed}'")),
     }
 }
@@ -299,6 +302,10 @@ mod tests {
         assert_eq!(
             parse_command_line("mic off").unwrap(),
             Command::SetMic(MicAction::Off)
+        );
+        assert_eq!(
+            parse_command_line("record toggle").unwrap(),
+            Command::Record(RecordAction::Toggle)
         );
         assert_eq!(parse_command_line("show").unwrap(), Command::Show);
         let json = serde_json::to_string(&Command::Status).unwrap();

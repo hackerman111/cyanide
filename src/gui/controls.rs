@@ -7,12 +7,12 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::config::{Config, LoopReturnPolicy, StartupMode, VideoFormat};
+use crate::config::{Config, LagConfig, LoopReturnPolicy, StartupMode, VideoFormat};
 use crate::devices::DeviceInventory;
 use crate::gui::{ConfigPatch, UiAction};
 use crate::hotkey::Hotkey;
 use crate::state::{
-    AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource,
+    AppState, AudioLevels, AudioSource, Command, MicAction, RecordAction, StreamMode, VideoSource,
 };
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
@@ -28,6 +28,19 @@ struct ComboBacking {
     labels: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MicComboEntry {
+    Disabled,
+    Device(String),
+    MissingPlaceholder,
+}
+
+#[derive(Default)]
+struct MicComboBacking {
+    entries: Vec<MicComboEntry>,
+    labels: Vec<String>,
+}
+
 pub struct ControlPanel {
     pub widget: gtk4::ScrolledWindow,
     syncing: Rc<Cell<bool>>,
@@ -39,6 +52,8 @@ pub struct ControlPanel {
     hotkey_row: adw::ActionRow,
     hotkey_entry: gtk4::Entry,
     loop_file_row: adw::ActionRow,
+    record_row: adw::ActionRow,
+    record_btn: gtk4::Button,
     real_cam_combo: adw::ComboRow,
     virt_cam_combo: adw::ComboRow,
     real_mic_combo: adw::ComboRow,
@@ -55,9 +70,19 @@ pub struct ControlPanel {
     crossfade_label: gtk4::Label,
     return_combo: adw::ComboRow,
     bookmark_label: gtk4::Label,
+    ping_pong_switch: adw::SwitchRow,
+    lag_switch: adw::SwitchRow,
+    lag_on_switch_row: adw::SwitchRow,
+    lag_interval_scale: gtk4::Scale,
+    lag_interval_label: gtk4::Label,
+    lag_min_scale: gtk4::Scale,
+    lag_min_label: gtk4::Label,
+    lag_max_scale: gtk4::Scale,
+    lag_max_label: gtk4::Label,
+    lag_cfg: Rc<Cell<LagConfig>>,
     real_cam_paths: Rc<RefCell<ComboBacking>>,
     virt_cam_paths: Rc<RefCell<ComboBacking>>,
-    real_mic_names: Rc<RefCell<ComboBacking>>,
+    real_mic_backing: Rc<RefCell<MicComboBacking>>,
 }
 
 impl ControlPanel {
@@ -351,9 +376,24 @@ impl ControlPanel {
         loop_file_row.add_suffix(&pick_btn);
         src_group.add(&loop_file_row);
 
+        let record_row = adw::ActionRow::builder()
+            .title("Запись с камеры")
+            .subtitle("Записать MP4 на лету и сразу загрузить в петлю")
+            .build();
+        let record_btn = gtk4::Button::with_label("● Записать");
+        record_btn.set_valign(gtk4::Align::Center);
+        {
+            let act = Rc::clone(&on_action);
+            record_btn.connect_clicked(move |_| {
+                act(UiAction::Command(Command::Record(RecordAction::Toggle)))
+            });
+        }
+        record_row.add_suffix(&record_btn);
+        src_group.add(&record_row);
+
         let real_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
         let virt_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
-        let real_mic_names = Rc::new(RefCell::new(ComboBacking::default()));
+        let real_mic_backing = Rc::new(RefCell::new(MicComboBacking::default()));
 
         let real_cam_combo = adw::ComboRow::builder().title("Реальная камера").build();
         {
@@ -395,15 +435,21 @@ impl ControlPanel {
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);
-            let names = Rc::clone(&real_mic_names);
+            let backing = Rc::clone(&real_mic_backing);
             real_mic_combo.connect_selected_notify(move |c| {
                 if s.get() {
                     return;
                 }
-                if let Some(Some(n)) = names.borrow().keys.get(c.selected() as usize) {
-                    act(UiAction::UpdateConfig(ConfigPatch::RealMic(Some(
-                        n.clone(),
-                    ))));
+                match backing.borrow().entries.get(c.selected() as usize) {
+                    Some(MicComboEntry::Disabled) => {
+                        act(UiAction::UpdateConfig(ConfigPatch::RealMic(None)));
+                    }
+                    Some(MicComboEntry::Device(name)) => {
+                        act(UiAction::UpdateConfig(ConfigPatch::RealMic(Some(
+                            name.clone(),
+                        ))));
+                    }
+                    Some(MicComboEntry::MissingPlaceholder) | None => {}
                 }
             });
         }
@@ -537,10 +583,26 @@ impl ControlPanel {
         audio_group.add(&cf_row);
         content.append(&audio_group);
 
-        // --- Group 4: Loop Return Point ---
+        // --- Group 4: Loop Playback & Return Point ---
         let loop_group = adw::PreferencesGroup::builder()
-            .title("Возврат к зацикленному видео")
+            .title("Зацикленное видео")
             .build();
+        let ping_pong_switch = adw::SwitchRow::builder()
+            .title("Реверс-петля (вперёд ↔ назад)")
+            .subtitle("В конце видео проигрывается в реверсе, затем снова вперёд")
+            .active(false)
+            .build();
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            ping_pong_switch.connect_active_notify(move |sw| {
+                if !s.get() {
+                    act(UiAction::UpdateConfig(ConfigPatch::LoopPingPong(
+                        sw.is_active(),
+                    )));
+                }
+            });
+        }
         let return_combo = adw::ComboRow::builder()
             .title("При возврате на MP4")
             .model(&gtk4::StringList::new(&[
@@ -575,9 +637,125 @@ impl ControlPanel {
                 act(UiAction::UpdateConfig(ConfigPatch::LoopReturn(policy)));
             });
         }
+        loop_group.add(&ping_pong_switch);
         loop_group.add(&return_combo);
         loop_group.add(&bm_row);
         content.append(&loop_group);
+
+        // --- Group 5: Bad Internet / Lag Simulation Mode ---
+        let lag_cfg = Rc::new(Cell::new(LagConfig::default()));
+        let lag_group = adw::PreferencesGroup::builder()
+            .title("Режим плохого интернета")
+            .build();
+        let lag_switch = adw::SwitchRow::builder()
+            .title("Случайные подвисания")
+            .subtitle("Добавляет подвисания в live и записанное видео")
+            .active(false)
+            .build();
+        let lag_on_switch_row = adw::SwitchRow::builder()
+            .title("Подвисание при смене камеры")
+            .subtitle("Обязательный лаг при переключении Loop ↔ Live")
+            .active(false)
+            .build();
+        let (lag_int_row, lag_interval_scale, lag_interval_label) =
+            make_labeled_slider_row("Интервал", 500.0, 15_000.0, 250.0, 3000.0, "3.0 с");
+        let (lag_min_row, lag_min_scale, lag_min_label) =
+            make_labeled_slider_row("Мин. лаг", 100.0, 5000.0, 50.0, 100.0, "100 мс");
+        let (lag_max_row, lag_max_scale, lag_max_label) =
+            make_labeled_slider_row("Макс. лаг", 100.0, 5000.0, 50.0, 500.0, "500 мс");
+
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            let cell = Rc::clone(&lag_cfg);
+            lag_switch.connect_active_notify(move |sw| {
+                if s.get() {
+                    return;
+                }
+                let mut l = cell.get();
+                l.enabled = sw.is_active();
+                cell.set(l);
+                act(UiAction::UpdateConfig(ConfigPatch::Lag(l)));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            let cell = Rc::clone(&lag_cfg);
+            lag_on_switch_row.connect_active_notify(move |sw| {
+                if s.get() {
+                    return;
+                }
+                let mut l = cell.get();
+                l.freeze_on_switch = sw.is_active();
+                cell.set(l);
+                act(UiAction::UpdateConfig(ConfigPatch::Lag(l)));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            let cell = Rc::clone(&lag_cfg);
+            let lbl = lag_interval_label.clone();
+            lag_interval_scale.connect_value_changed(move |sc| {
+                let ms = sc.value().round() as u32;
+                lbl.set_label(&format!("{:.1} с", ms as f64 / 1000.0));
+                if s.get() {
+                    return;
+                }
+                let mut l = cell.get();
+                l.interval_ms = ms;
+                cell.set(l);
+                act(UiAction::UpdateConfig(ConfigPatch::Lag(l)));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            let cell = Rc::clone(&lag_cfg);
+            let lbl = lag_min_label.clone();
+            lag_min_scale.connect_value_changed(move |sc| {
+                let ms = sc.value().round() as u32;
+                lbl.set_label(&format!("{ms} мс"));
+                if s.get() {
+                    return;
+                }
+                let mut l = cell.get();
+                l.min_duration_ms = ms;
+                if l.max_duration_ms < ms {
+                    l.max_duration_ms = ms;
+                }
+                cell.set(l);
+                act(UiAction::UpdateConfig(ConfigPatch::Lag(l)));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            let cell = Rc::clone(&lag_cfg);
+            let lbl = lag_max_label.clone();
+            lag_max_scale.connect_value_changed(move |sc| {
+                let ms = sc.value().round() as u32;
+                lbl.set_label(&format!("{ms} мс"));
+                if s.get() {
+                    return;
+                }
+                let mut l = cell.get();
+                l.max_duration_ms = ms;
+                if l.min_duration_ms > ms {
+                    l.min_duration_ms = ms;
+                }
+                cell.set(l);
+                act(UiAction::UpdateConfig(ConfigPatch::Lag(l)));
+            });
+        }
+
+        lag_group.add(&lag_switch);
+        lag_group.add(&lag_on_switch_row);
+        lag_group.add(&lag_int_row);
+        lag_group.add(&lag_min_row);
+        lag_group.add(&lag_max_row);
+        content.append(&lag_group);
 
         let widget = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -596,6 +774,8 @@ impl ControlPanel {
             hotkey_row,
             hotkey_entry,
             loop_file_row,
+            record_row,
+            record_btn,
             real_cam_combo,
             virt_cam_combo,
             real_mic_combo,
@@ -612,9 +792,19 @@ impl ControlPanel {
             crossfade_label,
             return_combo,
             bookmark_label,
+            ping_pong_switch,
+            lag_switch,
+            lag_on_switch_row,
+            lag_interval_scale,
+            lag_interval_label,
+            lag_min_scale,
+            lag_min_label,
+            lag_max_scale,
+            lag_max_label,
+            lag_cfg,
             real_cam_paths,
             virt_cam_paths,
-            real_mic_names,
+            real_mic_backing,
         }
     }
 
@@ -685,16 +875,15 @@ impl ControlPanel {
             cfg.virtual_camera.as_deref(),
             "Нет v4l2loopback",
         );
-        sync_combo(
+        sync_mic_combo(
             &self.real_mic_combo,
-            &self.real_mic_names,
-            devices
+            &self.real_mic_backing,
+            &devices
                 .real_mics
                 .iter()
                 .map(|d| (d.name.clone(), d.label.clone()))
-                .collect(),
+                .collect::<Vec<_>>(),
             cfg.real_mic.as_deref(),
-            "Системный по умолчанию",
         );
 
         let res_idx = RESOLUTIONS
@@ -726,6 +915,21 @@ impl ControlPanel {
         let secs = bm_ms / 1000;
         self.bookmark_label
             .set_label(&format!("Метка: {:02}:{:02}", secs / 60, secs % 60));
+        self.ping_pong_switch.set_active(cfg.loop_ping_pong);
+
+        self.lag_cfg.set(cfg.lag);
+        self.lag_switch.set_active(cfg.lag.enabled);
+        self.lag_on_switch_row.set_active(cfg.lag.freeze_on_switch);
+        self.lag_interval_scale
+            .set_value(cfg.lag.interval_ms as f64);
+        self.lag_interval_label
+            .set_label(&format!("{:.1} с", cfg.lag.interval_ms as f64 / 1000.0));
+        self.lag_min_scale.set_value(cfg.lag.min_duration_ms as f64);
+        self.lag_min_label
+            .set_label(&format!("{} мс", cfg.lag.min_duration_ms));
+        self.lag_max_scale.set_value(cfg.lag.max_duration_ms as f64);
+        self.lag_max_label
+            .set_label(&format!("{} мс", cfg.lag.max_duration_ms));
 
         self.syncing.set(prev);
     }
@@ -734,6 +938,31 @@ impl ControlPanel {
         self.loop_meter.set_value(db_to_unit(levels.loop_db));
         self.live_meter.set_value(db_to_unit(levels.live_db));
         self.out_meter.set_value(db_to_unit(levels.out_db));
+    }
+
+    pub fn update_recording_ui(&self, recording: bool, saving: bool, elapsed_ms: u64) {
+        if saving {
+            self.record_row.set_subtitle("Сохранение MP4…");
+            self.record_btn.set_label("Сохранение…");
+            self.record_btn.set_sensitive(false);
+            self.record_btn.remove_css_class("destructive-action");
+        } else if recording {
+            let secs = elapsed_ms / 1000;
+            self.record_row.set_subtitle(&format!(
+                "Идёт запись · {:02}:{:02}",
+                secs / 60,
+                secs % 60
+            ));
+            self.record_btn.set_label("■ Стоп");
+            self.record_btn.set_sensitive(true);
+            self.record_btn.add_css_class("destructive-action");
+        } else {
+            self.record_row
+                .set_subtitle("Записать MP4 на лету и сразу загрузить в петлю");
+            self.record_btn.set_label("● Записать");
+            self.record_btn.set_sensitive(true);
+            self.record_btn.remove_css_class("destructive-action");
+        }
     }
 }
 
@@ -756,6 +985,25 @@ fn sync_combo(
         state.labels = labels;
     }
     state.keys = keys;
+    if combo.selected() != idx {
+        combo.set_selected(idx);
+    }
+}
+
+fn sync_mic_combo(
+    combo: &adw::ComboRow,
+    backing: &RefCell<MicComboBacking>,
+    items: &[(String, String)],
+    selected: Option<&str>,
+) {
+    let (entries, labels, idx) = compute_optional_mic_entries(items, selected);
+    let mut state = backing.borrow_mut();
+    if state.labels != labels {
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        combo.set_model(Some(&gtk4::StringList::new(&refs)));
+        state.labels = labels;
+    }
+    state.entries = entries;
     if combo.selected() != idx {
         combo.set_selected(idx);
     }
@@ -843,6 +1091,33 @@ pub(crate) fn compute_combo_entries(
     (keys, labels, 0)
 }
 
+pub(crate) fn compute_optional_mic_entries(
+    items: &[(String, String)],
+    selected: Option<&str>,
+) -> (Vec<MicComboEntry>, Vec<String>, u32) {
+    let mut entries = Vec::with_capacity(items.len() + 2);
+    let mut labels = Vec::with_capacity(items.len() + 2);
+    entries.push(MicComboEntry::Disabled);
+    labels.push("Не передавать (выкл.)".to_string());
+
+    let mut idx = 0u32;
+    if let Some(sel) = selected {
+        if let Some(pos) = items.iter().position(|(k, _)| k == sel) {
+            idx = (pos + 1) as u32;
+        } else {
+            entries.push(MicComboEntry::MissingPlaceholder);
+            labels.push(format!("(отключено) {sel}"));
+            idx = 1;
+        }
+    }
+
+    for (k, l) in items {
+        entries.push(MicComboEntry::Device(k.clone()));
+        labels.push(l.clone());
+    }
+    (entries, labels, idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,5 +1143,29 @@ mod tests {
         assert_eq!(keys[0], None);
         assert_eq!(keys[1], Some("/dev/video0".into()));
         assert!(labels[0].contains("/dev/video99"));
+    }
+
+    #[test]
+    fn compute_optional_mic_defaults_to_disabled_and_handles_missing() {
+        let items = vec![
+            ("alsa_input.usb".into(), "USB Mic".into()),
+            ("alsa_input.pci".into(), "Built-in Mic".into()),
+        ];
+
+        let (entries, labels, idx) = compute_optional_mic_entries(&items, None);
+        assert_eq!(idx, 0);
+        assert_eq!(entries[0], MicComboEntry::Disabled);
+        assert_eq!(entries[1], MicComboEntry::Device("alsa_input.usb".into()));
+        assert_eq!(labels.len(), 3);
+
+        let (entries, _, idx) = compute_optional_mic_entries(&items, Some("alsa_input.pci"));
+        assert_eq!(idx, 2);
+        assert_eq!(entries[2], MicComboEntry::Device("alsa_input.pci".into()));
+
+        let (entries, labels, idx) = compute_optional_mic_entries(&items, Some("missing_mic"));
+        assert_eq!(idx, 1);
+        assert_eq!(entries[0], MicComboEntry::Disabled);
+        assert_eq!(entries[1], MicComboEntry::MissingPlaceholder);
+        assert!(labels[1].contains("missing_mic"));
     }
 }
