@@ -11,6 +11,7 @@ loop_volume = 1.0
 live_volume = 1.0
 av_delay_ms = 0
 crossfade_ms = 20
+loop_ping_pong = false
 
 [video]
 width = 1280

@@ -140,6 +140,7 @@ pub struct Config {
     pub crossfade_ms: u32,
     pub video: VideoFormat,
     pub loop_return: LoopReturnPolicy,
+    pub loop_ping_pong: bool,
     pub compare: CompareConfig,
     pub lag: LagConfig,
 }
@@ -159,6 +160,7 @@ impl Default for Config {
             crossfade_ms: 20,
             video: VideoFormat::default(),
             loop_return: LoopReturnPolicy::Continue,
+            loop_ping_pong: false,
             compare: CompareConfig::default(),
             lag: LagConfig::default(),
         }
@@ -259,6 +261,7 @@ mod tests {
         assert_eq!(cfg.crossfade_ms, 20);
         assert_eq!(cfg.av_delay_ms, 0);
         assert_eq!(cfg.real_mic, None);
+        assert!(!cfg.loop_ping_pong);
         assert!(!cfg.lag.enabled);
         assert!(!cfg.lag.freeze_on_switch);
         assert_eq!(cfg.lag.min_duration_ms, 100);

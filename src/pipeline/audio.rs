@@ -227,31 +227,49 @@ impl AudioBranch {
         }
 
         // Rebase segment base after flushing seeks so audiomixer never drops post-seek audio,
+        // drop audio during reverse ping-pong passes (silence_baseline keeps audiomixer ticking),
         // and drop upstream EOS so audiomixer keeps the loop pad open across restarts.
         if let Some(src_pad) = self.loop_input_queue.static_pad("src") {
             let rebaser = Arc::clone(&self.rebaser);
             let seen_gen = AtomicU64::new(0);
-            src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
-                    match ev.view() {
-                        gst::EventView::Segment(seg_ev) => {
-                            if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
-                                && let Some(rebased) = rebaser.rebase_if_needed(&seen_gen, seg)
-                            {
-                                let new_ev = gst::event::Segment::builder(&rebased)
-                                    .seqnum(ev.seqnum())
-                                    .build();
-                                info.data = Some(gst::PadProbeData::Event(new_ev));
+            let in_reverse = AtomicBool::new(false);
+            src_pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_pad, info| {
+                    match info.data {
+                        Some(gst::PadProbeData::Event(ref ev)) => match ev.view() {
+                            gst::EventView::Segment(seg_ev) => {
+                                if let Some(seg) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+                                {
+                                    if seg.rate() < 0.0 {
+                                        in_reverse.store(true, Ordering::Relaxed);
+                                        return gst::PadProbeReturn::Drop;
+                                    }
+                                    in_reverse.store(false, Ordering::Relaxed);
+                                    if let Some(rebased) = rebaser.rebase_if_needed(&seen_gen, seg)
+                                    {
+                                        let new_ev = gst::event::Segment::builder(&rebased)
+                                            .seqnum(ev.seqnum())
+                                            .build();
+                                        info.data = Some(gst::PadProbeData::Event(new_ev));
+                                    }
+                                }
                             }
-                        }
-                        gst::EventView::Eos(_) => {
+                            gst::EventView::Eos(_) => {
+                                return gst::PadProbeReturn::Drop;
+                            }
+                            _ => {}
+                        },
+                        Some(gst::PadProbeData::Buffer(_))
+                            if in_reverse.load(Ordering::Relaxed) =>
+                        {
                             return gst::PadProbeReturn::Drop;
                         }
                         _ => {}
                     }
-                }
-                gst::PadProbeReturn::Ok
-            });
+                    gst::PadProbeReturn::Ok
+                },
+            );
         }
 
         for el in &added {

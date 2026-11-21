@@ -17,10 +17,11 @@ use cyanide::gui::overlay::OverlayWindow;
 use cyanide::gui::{ConfigPatch, MainWindow, UiAction};
 use cyanide::hotkey::{Hotkey, HotkeyManager};
 use cyanide::ipc::{self, IpcRequest, IpcServerHandle};
+use cyanide::pipeline::record::{self, RecordingFinished};
 use cyanide::pipeline::{
     self, DegradedBranch, ForceFallback, MediaPipeline, PipelineEvent, PreviewBackend,
 };
-use cyanide::state::{AppState, Command, Reply};
+use cyanide::state::{AppState, Command, RecordAction, Reply};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
@@ -55,7 +56,7 @@ where
         "doctor" => Ok(CliAction::Doctor),
         "ctl" => {
             if items.len() < 2 {
-                return Err("missing ctl subcommand (try: toggle, mode, video, audio, mic, show, hide, status, quit)".into());
+                return Err("missing ctl subcommand (try: toggle, mode, video, audio, mic, record, show, hide, status, quit)".into());
             }
             let joined = items[1..].join(" ");
             let cmd = ipc::parse_command_line(&joined)?;
@@ -86,7 +87,7 @@ cyanide — Virtual camera (v4l2loopback) & virtual mic (PipeWire) studio
 
 USAGE:
   cyanide [--background] [--test-sources]
-  cyanide ctl <toggle|mode <loop|live>|video <loop|live>|audio <file|mic|mix|silence>|mic <on|off|toggle>|show|hide|status|quit>
+  cyanide ctl <toggle|mode <loop|live>|video <loop|live>|audio <file|mic|mix|silence>|mic <on|off|toggle>|record <start|stop|toggle>|show|hide|status|quit>
   cyanide doctor"
     );
 }
@@ -279,6 +280,8 @@ fn rebuild_pipeline(ctrl: &Rc<RefCell<AppController>>) {
         if let Some(mut old) = c.pipeline.take() {
             old.stop();
         }
+        c.state.recording = false;
+        c.state.recording_elapsed_ms = 0;
         let visible = c.any_window_visible();
         (
             c.config.clone(),
@@ -503,6 +506,7 @@ fn apply_command(ctrl: &Rc<RefCell<AppController>>, cmd: Command) -> Reply {
                 message: "shutting down".into(),
             }
         }
+        Command::Record(action) => handle_record_command(ctrl, action),
         mode_cmd => {
             // Runtime mode/mic/freeze commands NEVER overwrite startup_mode in config.toml.
             let mut c = ctrl.borrow_mut();
@@ -525,6 +529,120 @@ fn apply_command(ctrl: &Rc<RefCell<AppController>>, cmd: Command) -> Reply {
             }
             c.sync_window();
             Reply::Status(c.state.snapshot(&c.config))
+        }
+    }
+}
+
+fn handle_record_command(ctrl: &Rc<RefCell<AppController>>, action: RecordAction) -> Reply {
+    let want_start = {
+        let c = ctrl.borrow();
+        if c.state.recording_saving {
+            return Reply::Error {
+                message: "recording is currently finalizing".into(),
+            };
+        }
+        match action {
+            RecordAction::Start => true,
+            RecordAction::Stop => false,
+            RecordAction::Toggle => !c.state.recording,
+        }
+    };
+
+    if want_start {
+        let mut c = ctrl.borrow_mut();
+        if c.state.recording {
+            return Reply::Status(c.state.snapshot(&c.config));
+        }
+        let Some(ref pipe) = c.pipeline else {
+            return Reply::Error {
+                message: "pipeline is not running".into(),
+            };
+        };
+        let path = record::default_recording_path();
+        match pipe.start_recording(path, c.config.video.fps) {
+            Ok(_) => {
+                c.state.recording = true;
+                c.state.recording_elapsed_ms = 0;
+                c.sync_window();
+                Reply::Status(c.state.snapshot(&c.config))
+            }
+            Err(err) => {
+                c.state.health.output_warning = Some(format!("Ошибка записи: {err}"));
+                c.sync_window();
+                Reply::Error {
+                    message: err.to_string(),
+                }
+            }
+        }
+    } else {
+        let (active, snap) = {
+            let mut c = ctrl.borrow_mut();
+            let active = c
+                .pipeline
+                .as_ref()
+                .and_then(MediaPipeline::take_active_recording);
+            if active.is_none() {
+                c.state.recording = false;
+                c.state.recording_elapsed_ms = 0;
+                c.sync_window();
+                return Reply::Status(c.state.snapshot(&c.config));
+            }
+            c.state.recording = false;
+            c.state.recording_saving = true;
+            c.sync_window();
+            (active, c.state.snapshot(&c.config))
+        };
+
+        if let Some(active) = active {
+            let (tx, rx) = async_channel::bounded(1);
+            let spawn_res = std::thread::Builder::new()
+                .name("cyanide-rec-finalize".into())
+                .spawn(move || {
+                    let res = active.finalize();
+                    let _ = tx.send_blocking(res);
+                });
+            if let Err(err) = spawn_res {
+                on_recording_finished(ctrl, Err(format!("Не удалось завершить запись: {err}")));
+            } else {
+                let weak = Rc::downgrade(ctrl);
+                glib::spawn_future_local(async move {
+                    let Ok(res) = rx.recv().await else {
+                        return;
+                    };
+                    if let Some(ctrl_rc) = weak.upgrade() {
+                        on_recording_finished(&ctrl_rc, res);
+                    }
+                });
+            }
+        }
+
+        Reply::Status(snap)
+    }
+}
+
+fn on_recording_finished(
+    ctrl: &Rc<RefCell<AppController>>,
+    res: Result<RecordingFinished, String>,
+) {
+    match res {
+        Ok(finished) => {
+            {
+                let mut guard = ctrl.borrow_mut();
+                let c = &mut *guard;
+                c.state.recording_saving = false;
+                c.state.recording_elapsed_ms = 0;
+                c.config.loop_file = Some(finished.path);
+                c.fallback.loop_black = false;
+            }
+            schedule_config_save(ctrl);
+            rebuild_pipeline(ctrl);
+        }
+        Err(err) => {
+            let mut c = ctrl.borrow_mut();
+            c.state.recording_saving = false;
+            c.state.recording_elapsed_ms = 0;
+            c.state.health.output_warning = Some(err);
+            c.sync_window();
         }
     }
 }
@@ -590,6 +708,7 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             let mut av_delay_changed = false;
             let mut hotkey_changed = false;
             let mut lag_changed = false;
+            let mut ping_pong_changed = false;
 
             {
                 let mut guard = ctrl.borrow_mut();
@@ -650,6 +769,10 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                             (new_policy, _) => new_policy,
                         };
                     }
+                    ConfigPatch::LoopPingPong(enabled) => {
+                        c.config.loop_ping_pong = enabled;
+                        ping_pong_changed = true;
+                    }
                     ConfigPatch::Compare(cmp) => {
                         c.config.compare = cmp;
                     }
@@ -675,6 +798,9 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                 }
                 if lag_changed && let Some(ref pipe) = c.pipeline {
                     pipe.set_lag_config(c.config.lag);
+                }
+                if ping_pong_changed && let Some(ref pipe) = c.pipeline {
+                    pipe.set_loop_ping_pong(c.config.loop_ping_pong);
                 }
                 c.sync_window();
             }
@@ -888,8 +1014,26 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
                 let pos = c.state.loop_pos_ms;
                 let dur = c.state.loop_dur_ms;
                 let fps = c.config.video.fps;
+                let reversed = c
+                    .pipeline
+                    .as_ref()
+                    .is_some_and(MediaPipeline::is_loop_reversed);
+                if c.state.recording
+                    && let Some(elapsed) = c
+                        .pipeline
+                        .as_ref()
+                        .and_then(MediaPipeline::recording_elapsed_ms)
+                {
+                    c.state.recording_elapsed_ms = elapsed;
+                }
+                let rec = c.state.recording;
+                let saving = c.state.recording_saving;
+                let rec_ms = c.state.recording_elapsed_ms;
                 if let Some(ref win) = c.window {
-                    win.update_timecode(&fname, pos, dur, fps);
+                    win.update_timecode(&fname, pos, dur, fps, reversed);
+                    if rec {
+                        win.update_recording_timer(rec, saving, rec_ms);
+                    }
                 }
             }
             if overlay_visible

@@ -12,7 +12,7 @@ use crate::devices::DeviceInventory;
 use crate::gui::{ConfigPatch, UiAction};
 use crate::hotkey::Hotkey;
 use crate::state::{
-    AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource,
+    AppState, AudioLevels, AudioSource, Command, MicAction, RecordAction, StreamMode, VideoSource,
 };
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
@@ -52,6 +52,8 @@ pub struct ControlPanel {
     hotkey_row: adw::ActionRow,
     hotkey_entry: gtk4::Entry,
     loop_file_row: adw::ActionRow,
+    record_row: adw::ActionRow,
+    record_btn: gtk4::Button,
     real_cam_combo: adw::ComboRow,
     virt_cam_combo: adw::ComboRow,
     real_mic_combo: adw::ComboRow,
@@ -68,6 +70,7 @@ pub struct ControlPanel {
     crossfade_label: gtk4::Label,
     return_combo: adw::ComboRow,
     bookmark_label: gtk4::Label,
+    ping_pong_switch: adw::SwitchRow,
     lag_switch: adw::SwitchRow,
     lag_on_switch_row: adw::SwitchRow,
     lag_interval_scale: gtk4::Scale,
@@ -373,6 +376,21 @@ impl ControlPanel {
         loop_file_row.add_suffix(&pick_btn);
         src_group.add(&loop_file_row);
 
+        let record_row = adw::ActionRow::builder()
+            .title("Запись с камеры")
+            .subtitle("Записать MP4 на лету и сразу загрузить в петлю")
+            .build();
+        let record_btn = gtk4::Button::with_label("● Записать");
+        record_btn.set_valign(gtk4::Align::Center);
+        {
+            let act = Rc::clone(&on_action);
+            record_btn.connect_clicked(move |_| {
+                act(UiAction::Command(Command::Record(RecordAction::Toggle)))
+            });
+        }
+        record_row.add_suffix(&record_btn);
+        src_group.add(&record_row);
+
         let real_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
         let virt_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
         let real_mic_backing = Rc::new(RefCell::new(MicComboBacking::default()));
@@ -565,10 +583,26 @@ impl ControlPanel {
         audio_group.add(&cf_row);
         content.append(&audio_group);
 
-        // --- Group 4: Loop Return Point ---
+        // --- Group 4: Loop Playback & Return Point ---
         let loop_group = adw::PreferencesGroup::builder()
-            .title("Возврат к зацикленному видео")
+            .title("Зацикленное видео")
             .build();
+        let ping_pong_switch = adw::SwitchRow::builder()
+            .title("Реверс-петля (вперёд ↔ назад)")
+            .subtitle("В конце видео проигрывается в реверсе, затем снова вперёд")
+            .active(false)
+            .build();
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            ping_pong_switch.connect_active_notify(move |sw| {
+                if !s.get() {
+                    act(UiAction::UpdateConfig(ConfigPatch::LoopPingPong(
+                        sw.is_active(),
+                    )));
+                }
+            });
+        }
         let return_combo = adw::ComboRow::builder()
             .title("При возврате на MP4")
             .model(&gtk4::StringList::new(&[
@@ -603,6 +637,7 @@ impl ControlPanel {
                 act(UiAction::UpdateConfig(ConfigPatch::LoopReturn(policy)));
             });
         }
+        loop_group.add(&ping_pong_switch);
         loop_group.add(&return_combo);
         loop_group.add(&bm_row);
         content.append(&loop_group);
@@ -739,6 +774,8 @@ impl ControlPanel {
             hotkey_row,
             hotkey_entry,
             loop_file_row,
+            record_row,
+            record_btn,
             real_cam_combo,
             virt_cam_combo,
             real_mic_combo,
@@ -755,6 +792,7 @@ impl ControlPanel {
             crossfade_label,
             return_combo,
             bookmark_label,
+            ping_pong_switch,
             lag_switch,
             lag_on_switch_row,
             lag_interval_scale,
@@ -877,6 +915,7 @@ impl ControlPanel {
         let secs = bm_ms / 1000;
         self.bookmark_label
             .set_label(&format!("Метка: {:02}:{:02}", secs / 60, secs % 60));
+        self.ping_pong_switch.set_active(cfg.loop_ping_pong);
 
         self.lag_cfg.set(cfg.lag);
         self.lag_switch.set_active(cfg.lag.enabled);
@@ -899,6 +938,31 @@ impl ControlPanel {
         self.loop_meter.set_value(db_to_unit(levels.loop_db));
         self.live_meter.set_value(db_to_unit(levels.live_db));
         self.out_meter.set_value(db_to_unit(levels.out_db));
+    }
+
+    pub fn update_recording_ui(&self, recording: bool, saving: bool, elapsed_ms: u64) {
+        if saving {
+            self.record_row.set_subtitle("Сохранение MP4…");
+            self.record_btn.set_label("Сохранение…");
+            self.record_btn.set_sensitive(false);
+            self.record_btn.remove_css_class("destructive-action");
+        } else if recording {
+            let secs = elapsed_ms / 1000;
+            self.record_row.set_subtitle(&format!(
+                "Идёт запись · {:02}:{:02}",
+                secs / 60,
+                secs % 60
+            ));
+            self.record_btn.set_label("■ Стоп");
+            self.record_btn.set_sensitive(true);
+            self.record_btn.add_css_class("destructive-action");
+        } else {
+            self.record_row
+                .set_subtitle("Записать MP4 на лету и сразу загрузить в петлю");
+            self.record_btn.set_label("● Записать");
+            self.record_btn.set_sensitive(true);
+            self.record_btn.remove_css_class("destructive-action");
+        }
     }
 }
 

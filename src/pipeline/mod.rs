@@ -1,9 +1,11 @@
 pub mod audio;
 pub mod lag;
+pub mod record;
 pub mod similarity;
 pub mod video;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +19,7 @@ use thiserror::Error;
 
 use crate::config::{Config, LagConfig, LoopReturnPolicy};
 use crate::pipeline::audio::{AudioBranch, GainRamp, parse_level_message};
+use crate::pipeline::record::ActiveRecording;
 use crate::pipeline::video::{LOOP_EOS_MSG, SegmentRebaser, VideoBranch};
 use crate::state::{AppState, AudioLevels, SourceHealth, VideoSource};
 
@@ -234,6 +237,30 @@ impl MediaPipeline {
         self.video.lag.update_config(lag);
     }
 
+    pub fn set_loop_ping_pong(&self, enabled: bool) {
+        self.video.set_ping_pong(enabled);
+    }
+
+    pub fn is_loop_reversed(&self) -> bool {
+        self.video.is_loop_reversed()
+    }
+
+    pub fn start_recording(&self, path: PathBuf, fps: u32) -> Result<PathBuf, PipelineError> {
+        self.video.recorder.start(path, fps)
+    }
+
+    pub fn take_active_recording(&self) -> Option<ActiveRecording> {
+        self.video.recorder.take_active()
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.video.recorder.is_recording()
+    }
+
+    pub fn recording_elapsed_ms(&self) -> Option<u64> {
+        self.video.recorder.elapsed_ms()
+    }
+
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {
         self.video.loop_position_ms()
     }
@@ -261,6 +288,9 @@ impl MediaPipeline {
             return;
         }
         self.stopped = true;
+        if let Some(rec) = self.video.recorder.take_active() {
+            let _ = rec.finalize();
+        }
         if let Some(id) = self.ramp_source.borrow_mut().take() {
             id.remove();
         }
@@ -335,7 +365,7 @@ fn attach_bus_watch(
             }
             gst::MessageView::SegmentDone(_) => {
                 if let Some(p) = weak_pipe.upgrade() {
-                    video.seek_loop(&p, 0, false);
+                    video.advance_loop_segment(&p, false);
                 }
             }
             gst::MessageView::Application(app_msg) => {
@@ -345,14 +375,14 @@ fn attach_bus_watch(
                     && video.loop_source.is_some()
                     && let Some(p) = weak_pipe.upgrade()
                 {
-                    video.seek_loop(&p, 0, true);
+                    video.advance_loop_segment(&p, true);
                 }
             }
             gst::MessageView::Eos(_) => {
                 if video.loop_source.is_some()
                     && let Some(p) = weak_pipe.upgrade()
                 {
-                    video.seek_loop(&p, 0, true);
+                    video.advance_loop_segment(&p, true);
                 }
             }
             gst::MessageView::Element(_) => {
@@ -515,5 +545,158 @@ mod tests {
             mic, cam,
             "pulsesrc/live_mic_src errors must NOT degrade the live camera branch"
         );
+    }
+
+    #[test]
+    fn pipeline_records_live_mp4_and_plays_ping_pong_forward_reverse_forward() {
+        gst::init().unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let rec_path = std::env::temp_dir()
+                .join(format!("cyanide-pingpong-test-{}.mp4", std::process::id()));
+            let _ = std::fs::remove_file(&rec_path);
+
+            // Step 1: Record ~0.55s of live test video via MediaPipeline.
+            let rec_cfg = Config {
+                video: crate::config::VideoFormat {
+                    width: 320,
+                    height: 240,
+                    fps: 30,
+                },
+                ..Default::default()
+            };
+            let rec_state = AppState::from_config(&rec_cfg);
+            let mut rec_pipe =
+                MediaPipeline::start(&rec_cfg, &rec_state, PreviewBackend::Fake, true, |_| {})
+                    .unwrap();
+            let (res, gst_state, _) = rec_pipe.pipeline.state(gst::ClockTime::from_seconds(2));
+            assert!(res.is_ok() && gst_state == gst::State::Playing);
+
+            rec_pipe.start_recording(rec_path.clone(), 30).unwrap();
+            assert!(rec_pipe.is_recording());
+            std::thread::sleep(Duration::from_millis(600));
+            let active = rec_pipe
+                .take_active_recording()
+                .expect("recording must be active");
+            let finished = active.finalize().expect("mp4 recording must finalize");
+            assert!(
+                finished.frame_count >= 5,
+                "expected recorded frames, got {}",
+                finished.frame_count
+            );
+            rec_pipe.stop();
+
+            // Step 2: Play the recorded MP4 in ping-pong mode and verify forward -> reverse -> forward.
+            let play_cfg = Config {
+                startup_mode: StartupMode::Loop,
+                loop_file: Some(rec_path.clone()),
+                loop_ping_pong: true,
+                video: crate::config::VideoFormat {
+                    width: 320,
+                    height: 240,
+                    fps: 30,
+                },
+                ..Default::default()
+            };
+            let play_state = AppState::from_config(&play_cfg);
+            let errors = Rc::new(RefCell::new(Vec::<String>::new()));
+            let errors_cb = Rc::clone(&errors);
+            let mut play_pipe = MediaPipeline::start(
+                &play_cfg,
+                &play_state,
+                PreviewBackend::Fake,
+                true,
+                move |ev| match ev {
+                    PipelineEvent::Degraded { reason, .. } | PipelineEvent::FatalError(reason) => {
+                        errors_cb.borrow_mut().push(reason);
+                    }
+                    _ => {}
+                },
+            )
+            .unwrap();
+
+            // Record raw decoded PTS on loop_video_queue sink (before reverse-segment normalization)
+            // and paced output frames leaving loop_clocksync (after videorate + clocksync).
+            let raw_pts_log = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+            if let Some(q) = play_pipe.pipeline.by_name("loop_video_queue")
+                && let Some(sink_pad) = q.static_pad("sink")
+            {
+                let rlog = Arc::clone(&raw_pts_log);
+                sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    if let Some(gst::PadProbeData::Buffer(ref buf)) = info.data
+                        && let Some(pts) = buf.pts()
+                    {
+                        rlog.lock().unwrap().push(pts.mseconds());
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+            let pts_log = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+            if let Some(cs) = play_pipe.pipeline.by_name("loop_clocksync")
+                && let Some(src_pad) = cs.static_pad("src")
+            {
+                let log = Arc::clone(&pts_log);
+                src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    if let Some(gst::PadProbeData::Buffer(ref buf)) = info.data
+                        && let Some(pts) = buf.pts()
+                    {
+                        log.lock().unwrap().push(pts.mseconds());
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+
+                let vid = Rc::clone(&play_pipe.video);
+                let mut saw_reverse = false;
+                let mut saw_return_forward = false;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    while ctx.iteration(false) {}
+                    let rev = vid.is_loop_reversed();
+                    if rev {
+                        saw_reverse = true;
+                    } else if saw_reverse {
+                        saw_return_forward = true;
+                    }
+                    let count = pts_log.lock().unwrap().len();
+                    if saw_return_forward && count >= 45 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                assert!(
+                    errors.borrow().is_empty(),
+                    "unexpected pipeline errors: {:?}",
+                    errors.borrow()
+                );
+                let pts = pts_log.lock().unwrap().clone();
+                let raw_pts = raw_pts_log.lock().unwrap().clone();
+                assert!(saw_reverse, "ping-pong never entered reverse playback");
+                assert!(
+                    saw_return_forward,
+                    "ping-pong never returned to forward playback after reverse"
+                );
+                // Upstream decoded stream must have both ascending (forward) and descending (reverse) PTS.
+                let asc = raw_pts.windows(2).filter(|w| w[1] > w[0]).count();
+                let desc = raw_pts.windows(2).filter(|w| w[1] < w[0]).count();
+                assert!(asc >= 10, "expected ascending forward PTS, got {raw_pts:?}");
+                assert!(
+                    desc >= 10,
+                    "expected descending reverse PTS, got {raw_pts:?}"
+                );
+                // Downstream videorate + clocksync must emit all passes (~18 frames each) without dropping reverse.
+                assert!(
+                    pts.len() >= 45,
+                    "expected >= 45 paced frames across forward+reverse+forward, got {} ({pts:?})",
+                    pts.len()
+                );
+            } else {
+                panic!("missing loop_clocksync");
+            }
+
+            play_pipe.stop();
+            let _ = std::fs::remove_file(&rec_path);
+        })
+        .unwrap();
     }
 }
