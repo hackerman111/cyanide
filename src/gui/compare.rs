@@ -38,6 +38,14 @@ pub fn split_clip_rects(w: f32, h: f32, ratio: f32) -> (Rect4, Rect4) {
     ((0.0, 0.0, split_x, h), (split_x, 0.0, w - split_x, h))
 }
 
+/// Maps frame similarity `[0.0, 1.0]` to green glow intensity `[0.0, 1.0]`.
+pub fn match_green_strength(similarity: f32) -> f32 {
+    if !similarity.is_finite() {
+        return 0.0;
+    }
+    ((similarity - 0.60) / 0.25).clamp(0.0, 1.0)
+}
+
 /// Returns `(x, y, width, height)` 1px line rectangles for active grid, center axis, and custom guides.
 pub fn grid_segments(w: f32, h: f32, cfg: &CompareConfig) -> Vec<Rect4> {
     let mut segs = Vec::with_capacity(8);
@@ -88,6 +96,8 @@ mod imp {
         pub(super) live_bound: RefCell<Option<BoundPaintable>>,
         pub(super) frozen_frame: RefCell<Option<gdk::Paintable>>,
         pub(super) cfg: Cell<CompareConfig>,
+        pub(super) highlight_match: Cell<bool>,
+        pub(super) similarity: Cell<f32>,
         pub(super) drag_start_x: Cell<f64>,
         pub(super) on_split_changed: RefCell<Option<SplitCallback>>,
     }
@@ -214,7 +224,31 @@ mod imp {
                 }
             }
 
-            draw_overlays(snapshot, w, h, &cfg);
+            let green = if self.highlight_match.get() {
+                match_green_strength(self.similarity.get())
+            } else {
+                0.0
+            };
+            if green > 0.0 {
+                snapshot.append_color(&gdk::RGBA::new(0.08, 0.88, 0.35, 0.30 * green), &bounds);
+            }
+
+            draw_overlays(snapshot, w, h, &cfg, green);
+
+            if green > 0.0 {
+                let border = gdk::RGBA::new(0.15, 0.95, 0.42, 0.95 * green);
+                let t = 4.0f32;
+                snapshot.append_color(&border, &graphene::Rect::new(0.0, 0.0, w, t));
+                snapshot.append_color(&border, &graphene::Rect::new(0.0, h - t, w, t));
+                snapshot.append_color(
+                    &border,
+                    &graphene::Rect::new(0.0, t, t, (h - 2.0 * t).max(0.0)),
+                );
+                snapshot.append_color(
+                    &border,
+                    &graphene::Rect::new(w - t, t, t, (h - 2.0 * t).max(0.0)),
+                );
+            }
             snapshot.pop();
         }
     }
@@ -246,6 +280,23 @@ impl CompareView {
     pub fn set_config(&self, cfg: CompareConfig) {
         self.imp().cfg.set(cfg);
         self.queue_draw();
+    }
+
+    pub fn set_match_highlight(&self, enabled: bool) {
+        self.imp().highlight_match.set(enabled);
+        self.queue_draw();
+    }
+
+    pub fn set_similarity(&self, score: f32) {
+        let clamped = if score.is_finite() {
+            score.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if (self.imp().similarity.get() - clamped).abs() >= 0.005 {
+            self.imp().similarity.set(clamped);
+            self.queue_draw();
+        }
     }
 
     pub fn set_frozen(&self, frozen: bool) {
@@ -351,11 +402,16 @@ fn draw_transformed(
     snapshot.restore();
 }
 
-fn draw_overlays(snapshot: &gtk4::Snapshot, w: f32, h: f32, cfg: &CompareConfig) {
+fn draw_overlays(snapshot: &gtk4::Snapshot, w: f32, h: f32, cfg: &CompareConfig, green: f32) {
     let segs = grid_segments(w, h, cfg);
     let mut idx = 0usize;
     if cfg.show_grid {
-        let color = gdk::RGBA::new(1.0, 1.0, 1.0, 0.35);
+        let color = gdk::RGBA::new(
+            1.0 - 0.80 * green,
+            1.0,
+            1.0 - 0.55 * green,
+            0.35 + 0.45 * green,
+        );
         for &(x, y, sw, sh) in &segs[idx..idx + 4] {
             snapshot.append_color(&color, &graphene::Rect::new(x, y, sw, sh));
         }
@@ -400,5 +456,14 @@ mod tests {
         let segs = grid_segments(900.0, 600.0, &cfg);
         // 4 lines for 3x3 + 2 for center + 2 for custom guides = 8 segments
         assert_eq!(segs.len(), 8);
+    }
+
+    #[test]
+    fn match_green_strength_ramps_above_threshold() {
+        assert_eq!(match_green_strength(0.0), 0.0);
+        assert_eq!(match_green_strength(0.59), 0.0);
+        assert!((match_green_strength(0.725) - 0.5).abs() < 0.01);
+        assert_eq!(match_green_strength(0.90), 1.0);
+        assert_eq!(match_green_strength(f32::NAN), 0.0);
     }
 }

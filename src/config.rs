@@ -102,6 +102,7 @@ pub struct Config {
     pub real_camera: Option<String>,
     pub virtual_camera: Option<String>,
     pub real_mic: Option<String>,
+    pub hotkey: Option<String>,
     pub loop_volume: f64,
     pub live_volume: f64,
     pub av_delay_ms: i32,
@@ -119,6 +120,7 @@ impl Default for Config {
             real_camera: None,
             virtual_camera: None,
             real_mic: None,
+            hotkey: None,
             loop_volume: 1.0,
             live_volume: 1.0,
             av_delay_ms: 0,
@@ -161,6 +163,11 @@ impl Config {
         if self.real_mic.as_deref().is_some_and(is_forbidden_mic) {
             self.real_mic = None;
         }
+        self.hotkey = self
+            .hotkey
+            .as_deref()
+            .and_then(|s| crate::hotkey::Hotkey::parse(s).ok())
+            .map(|h| h.canonical());
         self
     }
 
@@ -239,6 +246,7 @@ mod tests {
                 ..Default::default()
             },
             real_mic: Some("VirtualCamMic".into()),
+            hotkey: Some("shift+super+f8".into()),
             ..Default::default()
         };
         let clean = cfg.sanitized();
@@ -250,6 +258,7 @@ mod tests {
         assert_eq!(clean.compare.zoom, 1.0);
         assert_eq!(clean.video.fps, 30);
         assert_eq!(clean.real_mic, None);
+        assert_eq!(clean.hotkey.as_deref(), Some("SUPER+SHIFT+F8"));
     }
 
     #[test]
