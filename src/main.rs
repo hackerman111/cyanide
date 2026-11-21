@@ -517,11 +517,17 @@ fn apply_command(ctrl: &Rc<RefCell<AppController>>, cmd: Command) -> Reply {
             let video_src = c.state.mode.video();
 
             if let Some(ref mut pipe) = c.pipeline {
-                if effect.video_changed {
-                    pipe.select_video(video_src, return_policy, effect.video_switched_to_loop);
-                }
+                let freeze_delay_ms = if effect.video_changed {
+                    pipe.select_video(video_src, return_policy, effect.video_switched_to_loop)
+                } else {
+                    None
+                };
                 if effect.audio_changed {
-                    pipe.start_audio_ramp(target, crossfade_ms);
+                    if let Some(delay_ms) = freeze_delay_ms {
+                        pipe.start_audio_ramp_delayed(target, crossfade_ms, delay_ms);
+                    } else {
+                        pipe.start_audio_ramp(target, crossfade_ms);
+                    }
                 }
                 if let Command::SetFreeze { frozen } = mode_cmd {
                     pipe.set_reference_frozen(frozen);

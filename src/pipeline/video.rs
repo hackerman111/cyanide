@@ -178,6 +178,25 @@ impl VideoBranch {
         self.selector.set_property("active-pad", pad);
     }
 
+    /// Switches video source; when `freeze_on_switch` is enabled, freezes the *current*
+    /// source's frame first and flips `input-selector` underneath so the viewer sees a natural
+    /// pre-switch stutter before transitioning to the new mode. Returns the freeze duration in ms.
+    pub fn select_with_pre_freeze(&self, source: VideoSource) -> Option<u32> {
+        let selector = self.selector.clone();
+        let target_pad = match source {
+            VideoSource::Loop => self.loop_sel_pad.clone(),
+            VideoSource::Live => self.live_sel_pad.clone(),
+        };
+        if let Some(dur_ms) = self.lag.arm_switch_freeze(move || {
+            selector.set_property("active-pad", &target_pad);
+        }) {
+            Some(dur_ms)
+        } else {
+            self.select(source);
+            None
+        }
+    }
+
     pub fn active_source(&self) -> VideoSource {
         match self.selector.property::<Option<gst::Pad>>("active-pad") {
             Some(pad) if pad == self.loop_sel_pad => VideoSource::Loop,
@@ -705,15 +724,15 @@ fn attach_lag_probe(out_clocksync: &gst::Element, lag: Arc<LagController>) {
     };
     src_pad.add_probe(
         gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
-        move |_pad, info| {
+        move |pad, info| {
             match info.data {
                 Some(gst::PadProbeData::Event(ref ev)) => {
-                    if matches!(ev.view(), gst::EventView::Caps(_)) {
-                        lag.clear_held();
+                    if let gst::EventView::Caps(c) = ev.view() {
+                        lag.on_caps(c.caps());
                     }
                 }
                 Some(gst::PadProbeData::Buffer(ref buf)) => {
-                    if let Some(frozen) = lag.process_buffer(buf) {
+                    if let Some(frozen) = lag.process_buffer(buf, || pad.current_caps()) {
                         info.data = Some(gst::PadProbeData::Buffer(frozen));
                     }
                 }

@@ -82,6 +82,7 @@ pub struct MediaPipeline {
     audio: Arc<AudioBranch>,
     bus_watch: Option<BusWatchGuard>,
     ramp_source: Rc<RefCell<Option<glib::SourceId>>>,
+    delayed_ramp_source: Rc<RefCell<Option<glib::SourceId>>>,
     ramp_state: Rc<RefCell<Option<GainRamp>>>,
     stopped: bool,
 }
@@ -149,6 +150,7 @@ impl MediaPipeline {
             audio,
             bus_watch,
             ramp_source: Rc::new(RefCell::new(None)),
+            delayed_ramp_source: Rc::new(RefCell::new(None)),
             ramp_state: Rc::new(RefCell::new(None)),
             stopped: false,
         })
@@ -159,8 +161,7 @@ impl MediaPipeline {
         source: VideoSource,
         return_policy: LoopReturnPolicy,
         switched_to_loop: bool,
-    ) {
-        self.video.lag.trigger_switch_freeze();
+    ) -> Option<u32> {
         if switched_to_loop {
             match return_policy {
                 LoopReturnPolicy::Continue => {}
@@ -172,49 +173,48 @@ impl MediaPipeline {
                 }
             }
         }
-        self.video.select(source);
+        self.video.select_with_pre_freeze(source)
     }
 
     pub fn active_video_source(&self) -> VideoSource {
         self.video.active_source()
     }
 
-    pub fn start_audio_ramp(&mut self, target: (f64, f64), crossfade_ms: u32) {
-        let duration = crossfade_ms.clamp(10, 30);
-        if let Some(existing) = self.ramp_state.borrow_mut().as_mut() {
-            existing.retarget(target, duration);
-            if self.ramp_source.borrow().is_some() {
-                return;
-            }
-        } else {
-            let start = self.audio.current_gains();
-            *self.ramp_state.borrow_mut() = Some(GainRamp::new(start, target, duration, 5));
-        }
-
-        if let Some(id) = self.ramp_source.borrow_mut().take() {
+    pub fn start_audio_ramp_delayed(
+        &mut self,
+        target: (f64, f64),
+        crossfade_ms: u32,
+        delay_ms: u32,
+    ) {
+        if let Some(id) = self.delayed_ramp_source.borrow_mut().take() {
             id.remove();
         }
-
+        if delay_ms == 0 {
+            self.start_audio_ramp(target, crossfade_ms);
+            return;
+        }
         let audio = Arc::clone(&self.audio);
         let ramp_state = Rc::clone(&self.ramp_state);
         let ramp_source = Rc::clone(&self.ramp_source);
-        let id = glib::timeout_add_local(Duration::from_millis(5), move || {
-            let mut slot = ramp_state.borrow_mut();
-            let Some(ramp) = slot.as_mut() else {
-                *ramp_source.borrow_mut() = None;
-                return glib::ControlFlow::Break;
-            };
-            let ((lg, rg), done) = ramp.step();
-            audio.set_gains(lg, rg);
-            if done {
-                *slot = None;
-                *ramp_source.borrow_mut() = None;
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
+        let delayed_slot = Rc::clone(&self.delayed_ramp_source);
+        let id = glib::timeout_add_local_once(Duration::from_millis(delay_ms as u64), move || {
+            *delayed_slot.borrow_mut() = None;
+            start_audio_ramp_inner(audio, ramp_state, ramp_source, target, crossfade_ms);
         });
-        *self.ramp_source.borrow_mut() = Some(id);
+        *self.delayed_ramp_source.borrow_mut() = Some(id);
+    }
+
+    pub fn start_audio_ramp(&mut self, target: (f64, f64), crossfade_ms: u32) {
+        if let Some(id) = self.delayed_ramp_source.borrow_mut().take() {
+            id.remove();
+        }
+        start_audio_ramp_inner(
+            Arc::clone(&self.audio),
+            Rc::clone(&self.ramp_state),
+            Rc::clone(&self.ramp_source),
+            target,
+            crossfade_ms,
+        );
     }
 
     pub fn set_av_delay_ms(&self, av_delay_ms: i32) {
@@ -291,6 +291,9 @@ impl MediaPipeline {
         if let Some(rec) = self.video.recorder.take_active() {
             let _ = rec.finalize();
         }
+        if let Some(id) = self.delayed_ramp_source.borrow_mut().take() {
+            id.remove();
+        }
         if let Some(id) = self.ramp_source.borrow_mut().take() {
             id.remove();
         }
@@ -330,6 +333,48 @@ pub fn check_runtime_plugins() -> Vec<(&'static str, bool)> {
         .iter()
         .map(|&name| (name, gst::ElementFactory::find(name).is_some()))
         .collect()
+}
+
+fn start_audio_ramp_inner(
+    audio: Arc<AudioBranch>,
+    ramp_state: Rc<RefCell<Option<GainRamp>>>,
+    ramp_source: Rc<RefCell<Option<glib::SourceId>>>,
+    target: (f64, f64),
+    crossfade_ms: u32,
+) {
+    let duration = crossfade_ms.clamp(10, 30);
+    if let Some(existing) = ramp_state.borrow_mut().as_mut() {
+        existing.retarget(target, duration);
+        if ramp_source.borrow().is_some() {
+            return;
+        }
+    } else {
+        let start = audio.current_gains();
+        *ramp_state.borrow_mut() = Some(GainRamp::new(start, target, duration, 5));
+    }
+
+    if let Some(id) = ramp_source.borrow_mut().take() {
+        id.remove();
+    }
+
+    let ramp_source_cb = Rc::clone(&ramp_source);
+    let id = glib::timeout_add_local(Duration::from_millis(5), move || {
+        let mut slot = ramp_state.borrow_mut();
+        let Some(ramp) = slot.as_mut() else {
+            *ramp_source_cb.borrow_mut() = None;
+            return glib::ControlFlow::Break;
+        };
+        let ((lg, rg), done) = ramp.step();
+        audio.set_gains(lg, rg);
+        if done {
+            *slot = None;
+            *ramp_source_cb.borrow_mut() = None;
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+    *ramp_source.borrow_mut() = Some(id);
 }
 
 fn apply_av_delay(video: &VideoBranch, audio: &AudioBranch, av_delay_ms: i32) {
@@ -696,6 +741,125 @@ mod tests {
 
             play_pipe.stop();
             let _ = std::fs::remove_file(&rec_path);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pipeline_switch_freeze_holds_old_camera_frame_before_new_mode() {
+        gst::init().unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let cfg = Config {
+                startup_mode: StartupMode::Live,
+                video: crate::config::VideoFormat {
+                    width: 160,
+                    height: 120,
+                    fps: 30,
+                },
+                lag: LagConfig {
+                    enabled: false,
+                    freeze_on_switch: true,
+                    interval_ms: 3000,
+                    min_duration_ms: 250,
+                    max_duration_ms: 250,
+                },
+                ..Default::default()
+            };
+            let state = AppState::from_config(&cfg);
+            let mut pipe =
+                MediaPipeline::start(&cfg, &state, PreviewBackend::Fake, true, |_| {}).unwrap();
+            let (res, gst_state, _) = pipe.pipeline.state(gst::ClockTime::from_seconds(2));
+            assert!(res.is_ok() && gst_state == gst::State::Playing);
+
+            // Inspect output frames on out_tee sink pad (immediately after LagController).
+            let switch_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            let samples = Arc::new(std::sync::Mutex::new(Vec::<(u64, u32, Vec<u8>)>::new()));
+            let pre_frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+            let tee = pipe.pipeline.by_name("out_tee").expect("out_tee");
+            let sink_pad = tee.static_pad("sink").expect("out_tee sink");
+            {
+                let sw = Arc::clone(&switch_at);
+                let log = Arc::clone(&samples);
+                let pre = Arc::clone(&pre_frames);
+                sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    if let Some(gst::PadProbeData::Buffer(ref buf)) = info.data
+                        && let Ok(map) = buf.map_readable()
+                    {
+                        // I420 Y-plane is the first 160*120 bytes.
+                        let y_plane = &map.as_slice()[..(160 * 120).min(map.len())];
+                        let mean_y = (y_plane.iter().map(|&b| b as u64).sum::<u64>()
+                            / (y_plane.len().max(1) as u64))
+                            as u32;
+                        if let Some(t0) = *sw.lock().unwrap() {
+                            let dt = t0.elapsed().as_millis() as u64;
+                            let sample_row = y_plane[..256.min(y_plane.len())].to_vec();
+                            log.lock().unwrap().push((dt, mean_y, sample_row));
+                        } else {
+                            pre.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+
+            // Wait for a few Live (ball) frames before switching.
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while pre_frames.load(Ordering::Relaxed) < 4
+                && std::time::Instant::now() < wait_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(pre_frames.load(Ordering::Relaxed) >= 4);
+
+            // Switch Live (dark ball) -> Loop (bright SMPTE bars).
+            *switch_at.lock().unwrap() = Some(std::time::Instant::now());
+            let delay = pipe.select_video(VideoSource::Loop, LoopReturnPolicy::Continue, true);
+            assert_eq!(delay, Some(250));
+
+            std::thread::sleep(Duration::from_millis(650));
+
+            let recorded = samples.lock().unwrap().clone();
+            // During the freeze window (40..210ms), frames must still be the frozen OLD Live frame (dark, identical).
+            let during_freeze: Vec<_> = recorded
+                .iter()
+                .filter(|(dt, _, _)| (40..=210).contains(dt))
+                .collect();
+            assert!(
+                during_freeze.len() >= 3,
+                "expected >= 3 frozen frames during switch freeze, got {}",
+                during_freeze.len()
+            );
+            let first_frozen_row = &during_freeze[0].2;
+            for (dt, mean_y, row) in &during_freeze {
+                assert!(
+                    *mean_y < 50,
+                    "at {dt}ms during freeze, expected OLD dark Live frame (mean_y < 50), got {mean_y}"
+                );
+                assert_eq!(
+                    row, first_frozen_row,
+                    "frame at {dt}ms changed during freeze instead of holding the old frame"
+                );
+            }
+
+            // After the freeze (> 340ms), output must have transitioned to the bright Loop (SMPTE) frames.
+            let after_freeze: Vec<_> = recorded.iter().filter(|(dt, _, _)| *dt >= 340).collect();
+            assert!(
+                after_freeze.len() >= 3,
+                "expected frames after freeze recovery, got {}",
+                after_freeze.len()
+            );
+            assert!(
+                after_freeze.iter().all(|(_, mean_y, _)| *mean_y > 80),
+                "expected NEW bright Loop (SMPTE) frames after freeze, got {:?}",
+                after_freeze
+                    .iter()
+                    .map(|(dt, y, _)| (*dt, *y))
+                    .collect::<Vec<_>>()
+            );
+
+            pipe.stop();
         })
         .unwrap();
     }

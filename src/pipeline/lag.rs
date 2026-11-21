@@ -17,7 +17,7 @@ pub enum LagDecision {
 enum ScheduleState {
     Idle,
     Waiting { next_freeze_ms: u64 },
-    PendingFreeze,
+    PendingFreeze { duration_ms: u64 },
     Frozen { until_ms: u64 },
 }
 
@@ -45,16 +45,29 @@ impl LagSchedule {
         self.cfg.enabled
             || matches!(
                 self.state,
-                ScheduleState::PendingFreeze | ScheduleState::Frozen { .. }
+                ScheduleState::PendingFreeze { .. } | ScheduleState::Frozen { .. }
             )
     }
 
-    pub fn trigger_switch_freeze(&mut self) -> bool {
+    pub fn is_frozen(&self) -> bool {
+        matches!(self.state, ScheduleState::Frozen { .. })
+    }
+
+    /// Arms a pre-switch freeze of random length within `[min_duration_ms, max_duration_ms]`.
+    /// Returns the chosen freeze duration in ms if `freeze_on_switch` is enabled.
+    pub fn arm_switch_freeze(&mut self, now_ms: u64, already_held: bool) -> Option<u32> {
         if !self.cfg.freeze_on_switch {
-            return false;
+            return None;
         }
-        self.state = ScheduleState::PendingFreeze;
-        true
+        let dur = self.next_duration_ms();
+        if already_held && matches!(self.state, ScheduleState::Frozen { .. }) {
+            self.state = ScheduleState::Frozen {
+                until_ms: now_ms.saturating_add(dur),
+            };
+        } else {
+            self.state = ScheduleState::PendingFreeze { duration_ms: dur };
+        }
+        Some(dur as u32)
     }
 
     pub fn update_config(&mut self, cfg: LagConfig, now_ms: u64) {
@@ -64,7 +77,7 @@ impl LagSchedule {
                 ScheduleState::Idle | ScheduleState::Waiting { .. } => {
                     self.state = ScheduleState::Idle;
                 }
-                ScheduleState::PendingFreeze => {
+                ScheduleState::PendingFreeze { .. } => {
                     if !self.cfg.freeze_on_switch {
                         self.state = ScheduleState::Idle;
                     }
@@ -100,7 +113,7 @@ impl LagSchedule {
                     };
                 }
             }
-            ScheduleState::PendingFreeze => {}
+            ScheduleState::PendingFreeze { .. } => {}
             ScheduleState::Frozen { until_ms } => {
                 let max_until = now_ms.saturating_add(self.cfg.max_duration_ms as u64);
                 if until_ms > max_until {
@@ -124,10 +137,9 @@ impl LagSchedule {
                 };
                 LagDecision::PassThrough
             }
-            ScheduleState::PendingFreeze => {
-                let dur = self.next_duration_ms();
+            ScheduleState::PendingFreeze { duration_ms } => {
                 self.state = ScheduleState::Frozen {
-                    until_ms: now_ms.saturating_add(dur),
+                    until_ms: now_ms.saturating_add(duration_ms),
                 };
                 LagDecision::StartFreeze
             }
@@ -195,9 +207,14 @@ impl LagSchedule {
     }
 }
 
+type SwitchCallback = Box<dyn FnOnce() + Send>;
+
 struct LagRuntime {
     schedule: LagSchedule,
     held: Option<gst::Buffer>,
+    held_caps: Option<gst::Caps>,
+    current_caps: Option<gst::Caps>,
+    pending_switch: Option<SwitchCallback>,
 }
 
 /// Injects configurable random frame freezes into the outgoing video stream
@@ -222,12 +239,16 @@ impl LagController {
             runtime: Mutex::new(LagRuntime {
                 schedule,
                 held: None,
+                held_caps: None,
+                current_caps: None,
+                pending_switch: None,
             }),
         }
     }
 
     pub fn update_config(&self, cfg: LagConfig) {
         let clean = cfg.sanitized();
+        let mut fire_after_lock: Option<SwitchCallback> = None;
         if let Ok(mut rt) = self.runtime.lock() {
             let now_ms = self.started.elapsed().as_millis() as u64;
             rt.schedule.update_config(clean, now_ms);
@@ -235,66 +256,124 @@ impl LagController {
             self.active.store(is_active, Ordering::Release);
             if !is_active {
                 rt.held = None;
+                rt.held_caps = None;
+                fire_after_lock = rt.pending_switch.take();
             }
         }
-    }
-
-    /// Triggers a random-length freeze on the next frame if `freeze_on_switch` is enabled.
-    pub fn trigger_switch_freeze(&self) {
-        if let Ok(mut rt) = self.runtime.lock()
-            && rt.schedule.trigger_switch_freeze()
-        {
-            self.active.store(true, Ordering::Release);
+        if let Some(cb) = fire_after_lock {
+            cb();
         }
     }
 
-    /// Drops cached frozen buffer on caps changes (e.g. Loop <-> Live format switch).
-    pub fn clear_held(&self) {
+    /// Arms a pre-switch freeze on the *current* source before running `on_captured` to switch
+    /// to the new source. Returns `Some(freeze_duration_ms)` when armed, or `None` if
+    /// `freeze_on_switch` is disabled (caller should switch immediately).
+    pub fn arm_switch_freeze(&self, on_captured: impl FnOnce() + Send + 'static) -> Option<u32> {
+        let mut fire_now: Option<SwitchCallback> = None;
+        let dur_ms = {
+            let Ok(mut rt) = self.runtime.lock() else {
+                return None;
+            };
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            let already_held = rt.held.is_some();
+            let dur = rt.schedule.arm_switch_freeze(now_ms, already_held)?;
+            self.active.store(true, Ordering::Release);
+            if already_held && rt.schedule.is_frozen() {
+                // Already frozen on a frame of the previous source: switch selector underneath
+                // while continuing to emit the frozen previous frame until the freeze ends.
+                rt.pending_switch = None;
+                fire_now = Some(Box::new(on_captured));
+            } else {
+                // Keep selector on the previous source until `StartFreeze` captures its frame.
+                rt.pending_switch = Some(Box::new(on_captured));
+            }
+            dur
+        };
+        if let Some(cb) = fire_now {
+            cb();
+        }
+        Some(dur_ms)
+    }
+
+    /// Updates tracked stream caps; only drops a cached frozen buffer when caps actually change
+    /// so redundant Caps events on identical-caps pad switches preserve the frozen previous frame.
+    pub fn on_caps(&self, caps: &gst::CapsRef) {
         if let Ok(mut rt) = self.runtime.lock() {
-            rt.held = None;
+            let same_as_held = rt
+                .held_caps
+                .as_ref()
+                .is_some_and(|prev| prev.is_equal_fixed(caps));
+            rt.current_caps = Some(caps.to_owned());
+            if !same_as_held {
+                rt.held = None;
+                rt.held_caps = None;
+            }
         }
     }
 
     /// Returns `Some(frozen_copy)` to replace the current frame during a freeze, or `None` to pass through.
-    pub fn process_buffer(&self, buf: &gst::BufferRef) -> Option<gst::Buffer> {
+    pub fn process_buffer(
+        &self,
+        buf: &gst::BufferRef,
+        fallback_caps: impl FnOnce() -> Option<gst::Caps>,
+    ) -> Option<gst::Buffer> {
         if !self.active.load(Ordering::Acquire) {
             return None;
         }
-        let Ok(mut rt) = self.runtime.lock() else {
-            return None;
-        };
-        let now_ms = self.started.elapsed().as_millis() as u64;
-        let decision = rt.schedule.step(now_ms);
-        if !rt.schedule.is_active() {
-            self.active.store(false, Ordering::Release);
-        }
-        match decision {
-            LagDecision::PassThrough => {
-                rt.held = None;
-                None
+        let mut fire_after_lock: Option<SwitchCallback> = None;
+        let out = {
+            let Ok(mut rt) = self.runtime.lock() else {
+                return None;
+            };
+            let now_ms = self.started.elapsed().as_millis() as u64;
+            let decision = rt.schedule.step(now_ms);
+            if !rt.schedule.is_active() {
+                self.active.store(false, Ordering::Release);
             }
-            LagDecision::StartFreeze => {
-                // Deep-copy once on freeze entry so upstream v4l2src buffer pools are released immediately.
-                rt.held = buf.copy_deep().ok();
-                None
-            }
-            LagDecision::HoldFreeze => {
-                let Some(ref held) = rt.held else {
-                    rt.held = buf.copy_deep().ok();
-                    return None;
-                };
-                // Shallow-copy shares the held sysmem pixels while stamping the incoming frame's timestamps.
-                let mut out = held.copy();
-                if let Some(out_ref) = out.get_mut() {
-                    out_ref.set_pts(buf.pts());
-                    out_ref.set_dts(buf.dts());
-                    out_ref.set_duration(buf.duration());
-                    out_ref.set_offset(buf.offset());
-                    out_ref.set_offset_end(buf.offset_end());
+            match decision {
+                LagDecision::PassThrough => {
+                    rt.held = None;
+                    rt.held_caps = None;
+                    fire_after_lock = rt.pending_switch.take();
+                    None
                 }
-                Some(out)
+                LagDecision::StartFreeze => {
+                    // Deep-copy once on freeze entry (from the OLD source before switching) so
+                    // upstream v4l2src buffer pools are released immediately.
+                    rt.held = buf.copy_deep().ok();
+                    if rt.current_caps.is_none() {
+                        rt.current_caps = fallback_caps();
+                    }
+                    rt.held_caps = rt.current_caps.clone();
+                    fire_after_lock = rt.pending_switch.take();
+                    None
+                }
+                LagDecision::HoldFreeze => {
+                    let Some(ref held) = rt.held else {
+                        rt.held = buf.copy_deep().ok();
+                        if rt.current_caps.is_none() {
+                            rt.current_caps = fallback_caps();
+                        }
+                        rt.held_caps = rt.current_caps.clone();
+                        return None;
+                    };
+                    // Shallow-copy shares the held sysmem pixels while stamping the incoming frame's timestamps.
+                    let mut out = held.copy();
+                    if let Some(out_ref) = out.get_mut() {
+                        out_ref.set_pts(buf.pts());
+                        out_ref.set_dts(buf.dts());
+                        out_ref.set_duration(buf.duration());
+                        out_ref.set_offset(buf.offset());
+                        out_ref.set_offset_end(buf.offset_end());
+                    }
+                    Some(out)
+                }
             }
+        };
+        if let Some(cb) = fire_after_lock {
+            cb();
         }
+        out
     }
 }
 
@@ -391,7 +470,10 @@ mod tests {
         assert_eq!(sched.step(0), LagDecision::PassThrough);
         assert_eq!(sched.step(5000), LagDecision::PassThrough);
 
-        assert!(sched.trigger_switch_freeze());
+        let dur = sched
+            .arm_switch_freeze(5000, false)
+            .expect("switch freeze must arm");
+        assert!((100..=500).contains(&dur));
         assert!(sched.is_active());
         assert_eq!(sched.step(5050), LagDecision::StartFreeze);
         assert_eq!(sched.step(5100), LagDecision::HoldFreeze);
@@ -420,7 +502,7 @@ mod tests {
             max_duration_ms: 500,
         };
         let mut sched = LagSchedule::new(cfg, 13);
-        assert!(!sched.trigger_switch_freeze());
+        assert!(sched.arm_switch_freeze(100, false).is_none());
         assert!(!sched.is_active());
         assert_eq!(sched.step(100), LagDecision::PassThrough);
     }
