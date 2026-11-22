@@ -42,8 +42,14 @@ struct MicComboBacking {
 }
 
 pub struct ControlPanel {
-    pub widget: gtk4::ScrolledWindow,
+    pub widget: gtk4::Box,
     syncing: Rc<Cell<bool>>,
+    out_picture: gtk4::Picture,
+    monitor_screen: gtk4::Box,
+    monitor_badge: gtk4::Label,
+    preset_loop_btn: gtk4::Button,
+    preset_live_btn: gtk4::Button,
+    quick_mic_btn: gtk4::ToggleButton,
     video_loop_btn: gtk4::ToggleButton,
     video_live_btn: gtk4::ToggleButton,
     audio_combo: adw::ComboRow,
@@ -60,10 +66,15 @@ pub struct ControlPanel {
     res_combo: adw::ComboRow,
     fps_combo: adw::ComboRow,
     loop_vol_scale: gtk4::Scale,
+    loop_vol_label: gtk4::Label,
     live_vol_scale: gtk4::Scale,
+    live_vol_label: gtk4::Label,
     loop_meter: gtk4::LevelBar,
+    loop_db_label: gtk4::Label,
     live_meter: gtk4::LevelBar,
+    live_db_label: gtk4::Label,
     out_meter: gtk4::LevelBar,
+    out_db_label: gtk4::Label,
     av_delay_scale: gtk4::Scale,
     av_delay_label: gtk4::Label,
     crossfade_scale: gtk4::Scale,
@@ -73,10 +84,13 @@ pub struct ControlPanel {
     ping_pong_switch: adw::SwitchRow,
     lag_switch: adw::SwitchRow,
     lag_on_switch_row: adw::SwitchRow,
+    lag_int_row: adw::ActionRow,
     lag_interval_scale: gtk4::Scale,
     lag_interval_label: gtk4::Label,
+    lag_min_row: adw::ActionRow,
     lag_min_scale: gtk4::Scale,
     lag_min_label: gtk4::Label,
+    lag_max_row: adw::ActionRow,
     lag_max_scale: gtk4::Scale,
     lag_max_label: gtk4::Label,
     lag_cfg: Rc<Cell<LagConfig>>,
@@ -91,43 +105,141 @@ impl ControlPanel {
         on_action: Rc<dyn Fn(UiAction)>,
         syncing: Rc<Cell<bool>>,
     ) -> Self {
-        let content = gtk4::Box::builder()
+        let widget = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .spacing(12)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
+            .spacing(10)
+            .margin_top(10)
+            .margin_bottom(10)
+            .margin_start(10)
             .margin_end(12)
+            .width_request(396)
+            .vexpand(true)
             .build();
 
-        // --- Group 1: Virtual Devices & Stream Routing ---
-        let routing_group = adw::PreferencesGroup::builder()
-            .title("Виртуальные устройства")
+        // === Fixed Top: Virtual Camera Program Monitor ("В эфире") ===
+        let monitor_card = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(8)
             .build();
+        monitor_card.add_css_class("card");
+        monitor_card.add_css_class("cyanide-monitor-card");
 
-        let preset_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let mon_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let mon_title = gtk4::Label::new(Some("ВЫХОД ВИРТУАЛЬНОЙ КАМЕРЫ"));
+        mon_title.set_xalign(0.0);
+        mon_title.set_hexpand(true);
+        mon_title.add_css_class("caption-heading");
+        mon_title.add_css_class("dim-label");
+
+        let monitor_badge = gtk4::Label::new(Some("● LIVE"));
+        monitor_badge.add_css_class("cyanide-status-pill");
+        monitor_badge.add_css_class("live");
+        mon_header.append(&mon_title);
+        mon_header.append(&monitor_badge);
+        monitor_card.append(&mon_header);
+
+        let out_picture = gtk4::Picture::builder()
+            .height_request(158)
+            .can_shrink(true)
+            .content_fit(gtk4::ContentFit::Contain)
+            .hexpand(true)
+            .build();
+        let monitor_screen = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        monitor_screen.add_css_class("cyanide-monitor-screen");
+        monitor_screen.add_css_class("live");
+        monitor_screen.set_overflow(gtk4::Overflow::Hidden);
+        monitor_screen.append(&out_picture);
+        monitor_card.append(&monitor_screen);
+
+        let quick_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let preset_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         preset_box.add_css_class("linked");
-        let preset_loop = gtk4::Button::with_label("Режим Loop");
-        let preset_live = gtk4::Button::with_label("Режим Live");
+        preset_box.set_hexpand(true);
+        preset_box.set_homogeneous(true);
+
+        let preset_loop_btn = gtk4::Button::with_label("Режим Loop");
+        let preset_live_btn = gtk4::Button::with_label("Режим Live");
         {
             let act = Rc::clone(&on_action);
-            preset_loop.connect_clicked(move |_| {
+            preset_loop_btn.connect_clicked(move |_| {
                 act(UiAction::Command(Command::SetMode(StreamMode::Loop)))
             });
             let act = Rc::clone(&on_action);
-            preset_live.connect_clicked(move |_| {
+            preset_live_btn.connect_clicked(move |_| {
                 act(UiAction::Command(Command::SetMode(StreamMode::Live)))
             });
         }
-        preset_box.append(&preset_loop);
-        preset_box.append(&preset_live);
-        let preset_row = adw::ActionRow::builder()
-            .title("Быстрое переключение")
-            .build();
-        preset_row.add_suffix(&preset_box);
-        routing_group.add(&preset_row);
+        preset_box.append(&preset_loop_btn);
+        preset_box.append(&preset_live_btn);
 
-        let video_loop_btn = gtk4::ToggleButton::with_label("Зацикленное");
+        let quick_mic_btn = gtk4::ToggleButton::new();
+        quick_mic_btn.set_icon_name("audio-input-microphone-symbolic");
+        quick_mic_btn.set_tooltip_text(Some("Включить/выключить виртуальный микрофон"));
+        quick_mic_btn.set_active(true);
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            quick_mic_btn.connect_toggled(move |b| {
+                if s.get() {
+                    return;
+                }
+                let action = if b.is_active() {
+                    MicAction::On
+                } else {
+                    MicAction::Off
+                };
+                act(UiAction::Command(Command::SetMic(action)));
+            });
+        }
+        quick_row.append(&preset_box);
+        quick_row.append(&quick_mic_btn);
+        monitor_card.append(&quick_row);
+        widget.append(&monitor_card);
+
+        // === Compact 4-Tab Studio Switcher ===
+        let stack = gtk4::Stack::builder()
+            .transition_type(gtk4::StackTransitionType::Crossfade)
+            .transition_duration(140)
+            .vexpand(true)
+            .build();
+
+        let tab_strip = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .homogeneous(true)
+            .build();
+        tab_strip.add_css_class("cyanide-tab-strip");
+
+        let tab_stream = make_tab_button("Эфир", None);
+        let tab_devices = make_tab_button("Устройства", Some(&tab_stream));
+        let tab_audio = make_tab_button("Аудио", Some(&tab_stream));
+        let tab_effects = make_tab_button("Петля", Some(&tab_stream));
+        tab_stream.set_active(true);
+
+        for (btn, name) in [
+            (&tab_stream, "stream"),
+            (&tab_devices, "devices"),
+            (&tab_audio, "audio"),
+            (&tab_effects, "effects"),
+        ] {
+            let st = stack.clone();
+            btn.connect_toggled(move |b| {
+                if b.is_active() {
+                    st.set_visible_child_name(name);
+                }
+            });
+            tab_strip.append(btn);
+        }
+        widget.append(&tab_strip);
+
+        // === Page 1: Эфир (Stream Routing, MP4 & Recording, Hotkey) ===
+        let stream_box = make_tab_page_box();
+
+        let routing_group = adw::PreferencesGroup::builder()
+            .title("Маршрутизация")
+            .build();
+
+        let video_loop_btn = gtk4::ToggleButton::with_label("MP4");
         let video_live_btn = gtk4::ToggleButton::with_label("Камера");
         video_live_btn.set_group(Some(&video_loop_btn));
         {
@@ -148,6 +260,7 @@ impl ControlPanel {
         }
         let video_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         video_box.add_css_class("linked");
+        video_box.set_valign(gtk4::Align::Center);
         video_box.append(&video_loop_btn);
         video_box.append(&video_live_btn);
         let video_row = adw::ActionRow::builder().title("Видеопоток").build();
@@ -202,152 +315,18 @@ impl ControlPanel {
             });
         }
         routing_group.add(&mic_switch);
+        stream_box.append(&routing_group);
 
-        let startup_combo = adw::ComboRow::builder()
-            .title("Режим при старте")
-            .model(&gtk4::StringList::new(&[
-                "Настоящая камера",
-                "Зацикленное видео",
-            ]))
+        let media_group = adw::PreferencesGroup::builder()
+            .title("Видео для петли")
             .build();
-        {
-            let act = Rc::clone(&on_action);
-            let s = Rc::clone(&syncing);
-            startup_combo.connect_selected_notify(move |c| {
-                if s.get() {
-                    return;
-                }
-                let mode = if c.selected() == 0 {
-                    StartupMode::Live
-                } else {
-                    StartupMode::Loop
-                };
-                act(UiAction::UpdateConfig(ConfigPatch::StartupMode(mode)));
-            });
-        }
-        routing_group.add(&startup_combo);
-
-        let hotkey_row = adw::ActionRow::builder()
-            .title("Системный хоткей")
-            .subtitle("Переключение Loop ↔ Live")
-            .build();
-        let hotkey_entry = gtk4::Entry::builder()
-            .placeholder_text("SUPER+F8")
-            .width_chars(12)
-            .valign(gtk4::Align::Center)
-            .build();
-        let record_btn = gtk4::ToggleButton::with_label("Записать");
-        record_btn.set_valign(gtk4::Align::Center);
-        let clear_hk_btn = gtk4::Button::from_icon_name("edit-clear-symbolic");
-        clear_hk_btn.set_valign(gtk4::Align::Center);
-        clear_hk_btn.set_tooltip_text(Some("Убрать системный хоткей"));
-
-        let recording = Rc::new(Cell::new(false));
-        {
-            let act = Rc::clone(&on_action);
-            let row_ref = hotkey_row.clone();
-            hotkey_entry.connect_activate(move |entry| {
-                let raw = entry.text();
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
-                    return;
-                }
-                match Hotkey::parse(trimmed) {
-                    Ok(hk) => {
-                        let canon = hk.canonical();
-                        entry.set_text(&canon);
-                        act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
-                    }
-                    Err(err) => {
-                        row_ref.set_subtitle(&err);
-                    }
-                }
-            });
-        }
-        {
-            let rec = Rc::clone(&recording);
-            let act = Rc::clone(&on_action);
-            record_btn.connect_toggled(move |b| {
-                let active = b.is_active();
-                rec.set(active);
-                b.set_label(if active {
-                    "Нажмите…"
-                } else {
-                    "Записать"
-                });
-                act(UiAction::SetHotkeyCapture(active));
-            });
-        }
-        {
-            let act = Rc::clone(&on_action);
-            let entry = hotkey_entry.clone();
-            let rec_btn = record_btn.clone();
-            clear_hk_btn.connect_clicked(move |_| {
-                if rec_btn.is_active() {
-                    rec_btn.set_active(false);
-                }
-                entry.set_text("");
-                act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
-            });
-        }
-
-        let key_ctrl = gtk4::EventControllerKey::new();
-        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        {
-            let rec = Rc::clone(&recording);
-            let rec_btn = record_btn.clone();
-            let entry = hotkey_entry.clone();
-            let act = Rc::clone(&on_action);
-            key_ctrl.connect_key_pressed(move |_, key, _, state| {
-                if !rec.get() {
-                    return glib::Propagation::Proceed;
-                }
-                if key == gdk::Key::Escape {
-                    rec_btn.set_active(false);
-                    return glib::Propagation::Stop;
-                }
-                if let Some(hk) = Hotkey::from_gdk(key, state) {
-                    let canon = hk.canonical();
-                    rec.set(false);
-                    entry.set_text(&canon);
-                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
-                    rec_btn.set_active(false);
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Stop
-            });
-        }
-        window.add_controller(key_ctrl);
-
-        let hk_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        hk_box.set_valign(gtk4::Align::Center);
-        hk_box.append(&hotkey_entry);
-        hk_box.append(&record_btn);
-        hk_box.append(&clear_hk_btn);
-        hotkey_row.add_suffix(&hk_box);
-        routing_group.add(&hotkey_row);
-
-        content.append(&routing_group);
-
-        // --- Group 2: Sources & Format ---
-        let src_group = adw::PreferencesGroup::builder()
-            .title("Источники и формат")
-            .build();
-
-        let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
-        refresh_btn.set_tooltip_text(Some("Обновить список устройств"));
-        {
-            let act = Rc::clone(&on_action);
-            refresh_btn.connect_clicked(move |_| act(UiAction::RefreshDevices));
-        }
-        src_group.set_header_suffix(Some(&refresh_btn));
 
         let loop_file_row = adw::ActionRow::builder()
             .title("Файл MP4")
             .subtitle("Не выбран")
             .build();
         let pick_btn = gtk4::Button::with_label("Выбрать");
+        pick_btn.set_valign(gtk4::Align::Center);
         {
             let win = window.clone();
             let act = Rc::clone(&on_action);
@@ -374,7 +353,7 @@ impl ControlPanel {
             });
         }
         loop_file_row.add_suffix(&pick_btn);
-        src_group.add(&loop_file_row);
+        media_group.add(&loop_file_row);
 
         let record_row = adw::ActionRow::builder()
             .title("Запись с камеры")
@@ -389,7 +368,154 @@ impl ControlPanel {
             });
         }
         record_row.add_suffix(&record_btn);
-        src_group.add(&record_row);
+        media_group.add(&record_row);
+        stream_box.append(&media_group);
+
+        let control_group = adw::PreferencesGroup::builder().title("Управление").build();
+
+        let hotkey_row = adw::ActionRow::builder()
+            .title("Системный хоткей")
+            .subtitle("Переключение Loop ↔ Live")
+            .build();
+        let hotkey_entry = gtk4::Entry::builder()
+            .placeholder_text("SUPER+F8")
+            .width_chars(10)
+            .valign(gtk4::Align::Center)
+            .build();
+        let hk_record_btn = gtk4::ToggleButton::with_label("Задать");
+        hk_record_btn.set_valign(gtk4::Align::Center);
+        let clear_hk_btn = gtk4::Button::from_icon_name("edit-clear-symbolic");
+        clear_hk_btn.set_valign(gtk4::Align::Center);
+        clear_hk_btn.add_css_class("flat");
+        clear_hk_btn.set_tooltip_text(Some("Убрать системный хоткей"));
+
+        let hk_capturing = Rc::new(Cell::new(false));
+        {
+            let act = Rc::clone(&on_action);
+            let row_ref = hotkey_row.clone();
+            hotkey_entry.connect_activate(move |entry| {
+                let raw = entry.text();
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
+                    return;
+                }
+                match Hotkey::parse(trimmed) {
+                    Ok(hk) => {
+                        let canon = hk.canonical();
+                        entry.set_text(&canon);
+                        act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
+                    }
+                    Err(err) => {
+                        row_ref.set_subtitle(&err);
+                    }
+                }
+            });
+        }
+        {
+            let rec = Rc::clone(&hk_capturing);
+            let act = Rc::clone(&on_action);
+            hk_record_btn.connect_toggled(move |b| {
+                let active = b.is_active();
+                rec.set(active);
+                b.set_label(if active {
+                    "Нажмите…"
+                } else {
+                    "Задать"
+                });
+                act(UiAction::SetHotkeyCapture(active));
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            let entry = hotkey_entry.clone();
+            let rec_btn = hk_record_btn.clone();
+            clear_hk_btn.connect_clicked(move |_| {
+                if rec_btn.is_active() {
+                    rec_btn.set_active(false);
+                }
+                entry.set_text("");
+                act(UiAction::UpdateConfig(ConfigPatch::Hotkey(None)));
+            });
+        }
+
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        {
+            let rec = Rc::clone(&hk_capturing);
+            let rec_btn = hk_record_btn.clone();
+            let entry = hotkey_entry.clone();
+            let act = Rc::clone(&on_action);
+            key_ctrl.connect_key_pressed(move |_, key, _, state| {
+                if !rec.get() {
+                    return glib::Propagation::Proceed;
+                }
+                if key == gdk::Key::Escape {
+                    rec_btn.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                if let Some(hk) = Hotkey::from_gdk(key, state) {
+                    let canon = hk.canonical();
+                    rec.set(false);
+                    entry.set_text(&canon);
+                    act(UiAction::UpdateConfig(ConfigPatch::Hotkey(Some(canon))));
+                    rec_btn.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Stop
+            });
+        }
+        window.add_controller(key_ctrl);
+
+        let hk_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        hk_box.set_valign(gtk4::Align::Center);
+        hk_box.append(&hotkey_entry);
+        hk_box.append(&hk_record_btn);
+        hk_box.append(&clear_hk_btn);
+        hotkey_row.add_suffix(&hk_box);
+        control_group.add(&hotkey_row);
+
+        let startup_combo = adw::ComboRow::builder()
+            .title("Режим при старте")
+            .model(&gtk4::StringList::new(&[
+                "Настоящая камера",
+                "Зацикленное видео",
+            ]))
+            .build();
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            startup_combo.connect_selected_notify(move |c| {
+                if s.get() {
+                    return;
+                }
+                let mode = if c.selected() == 0 {
+                    StartupMode::Live
+                } else {
+                    StartupMode::Loop
+                };
+                act(UiAction::UpdateConfig(ConfigPatch::StartupMode(mode)));
+            });
+        }
+        control_group.add(&startup_combo);
+        stream_box.append(&control_group);
+
+        stack.add_named(&wrap_scroll(&stream_box), Some("stream"));
+
+        // === Page 2: Устройства (Cameras, Mic, Format) ===
+        let devices_box = make_tab_page_box();
+
+        let hw_group = adw::PreferencesGroup::builder()
+            .title("Оборудование")
+            .build();
+        let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
+        refresh_btn.add_css_class("flat");
+        refresh_btn.set_tooltip_text(Some("Обновить список устройств"));
+        {
+            let act = Rc::clone(&on_action);
+            refresh_btn.connect_clicked(move |_| act(UiAction::RefreshDevices));
+        }
+        hw_group.set_header_suffix(Some(&refresh_btn));
 
         let real_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
         let virt_cam_paths = Rc::new(RefCell::new(ComboBacking::default()));
@@ -411,7 +537,7 @@ impl ControlPanel {
                 }
             });
         }
-        src_group.add(&real_cam_combo);
+        hw_group.add(&real_cam_combo);
 
         let virt_cam_combo = adw::ComboRow::builder().title("Виртуальная камера").build();
         {
@@ -429,7 +555,7 @@ impl ControlPanel {
                 }
             });
         }
-        src_group.add(&virt_cam_combo);
+        hw_group.add(&virt_cam_combo);
 
         let real_mic_combo = adw::ComboRow::builder().title("Реальный микрофон").build();
         {
@@ -453,8 +579,12 @@ impl ControlPanel {
                 }
             });
         }
-        src_group.add(&real_mic_combo);
+        hw_group.add(&real_mic_combo);
+        devices_box.append(&hw_group);
 
+        let fmt_group = adw::PreferencesGroup::builder()
+            .title("Формат вывода")
+            .build();
         let res_labels: Vec<&str> = RESOLUTIONS.iter().map(|r| r.2).collect();
         let res_combo = adw::ComboRow::builder()
             .title("Разрешение")
@@ -509,49 +639,72 @@ impl ControlPanel {
                 }
             });
         }
-        src_group.add(&res_combo);
-        src_group.add(&fps_combo);
-        content.append(&src_group);
+        fmt_group.add(&res_combo);
+        fmt_group.add(&fps_combo);
+        devices_box.append(&fmt_group);
 
-        // --- Group 3: Audio, Meters & A/V Sync ---
-        let audio_group = adw::PreferencesGroup::builder()
-            .title("Аудио и синхронизация")
+        stack.add_named(&wrap_scroll(&devices_box), Some("devices"));
+
+        // === Page 3: Аудио (Compact VU Meters + Gains + A/V Sync) ===
+        let audio_box = make_tab_page_box();
+
+        let vu_group = adw::PreferencesGroup::builder()
+            .title("Уровни сигнала (VU)")
+            .build();
+        let vu_card = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        vu_card.add_css_class("card");
+        vu_card.add_css_class("cyanide-vu-card");
+
+        let (loop_vu_row, loop_meter, loop_db_label) = make_vu_channel("Файл MP4");
+        let (live_vu_row, live_meter, live_db_label) = make_vu_channel("Микрофон");
+        let (out_vu_row, out_meter, out_db_label) = make_vu_channel("VirtualCamMic");
+        vu_card.append(&loop_vu_row);
+        vu_card.append(&live_vu_row);
+        vu_card.append(&out_vu_row);
+        vu_group.add(&vu_card);
+        audio_box.append(&vu_group);
+
+        let mix_group = adw::PreferencesGroup::builder()
+            .title("Громкость и синхронизация")
             .build();
 
-        let (loop_vol_row, loop_vol_scale) = make_slider_row("Громкость MP4", 0.0, 1.5, 0.05, 1.0);
+        let (loop_vol_row, loop_vol_scale, loop_vol_label) =
+            make_labeled_slider_row("Громкость MP4", 0.0, 1.5, 0.05, 1.0, "100%");
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);
+            let lbl = loop_vol_label.clone();
             loop_vol_scale.connect_value_changed(move |sc| {
+                let pct = (sc.value() * 100.0).round() as u32;
+                lbl.set_label(&format!("{pct}%"));
                 if !s.get() {
                     act(UiAction::UpdateConfig(ConfigPatch::LoopVolume(sc.value())));
                 }
             });
         }
-        audio_group.add(&loop_vol_row);
+        mix_group.add(&loop_vol_row);
 
-        let (live_vol_row, live_vol_scale) =
-            make_slider_row("Громкость микрофона", 0.0, 1.5, 0.05, 1.0);
+        let (live_vol_row, live_vol_scale, live_vol_label) =
+            make_labeled_slider_row("Микрофон", 0.0, 1.5, 0.05, 1.0, "100%");
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);
+            let lbl = live_vol_label.clone();
             live_vol_scale.connect_value_changed(move |sc| {
+                let pct = (sc.value() * 100.0).round() as u32;
+                lbl.set_label(&format!("{pct}%"));
                 if !s.get() {
                     act(UiAction::UpdateConfig(ConfigPatch::LiveVolume(sc.value())));
                 }
             });
         }
-        audio_group.add(&live_vol_row);
-
-        let (loop_meter_row, loop_meter) = make_meter_row("Уровень MP4");
-        let (live_meter_row, live_meter) = make_meter_row("Уровень микрофона");
-        let (out_meter_row, out_meter) = make_meter_row("Выход VirtualCamMic");
-        audio_group.add(&loop_meter_row);
-        audio_group.add(&live_meter_row);
-        audio_group.add(&out_meter_row);
+        mix_group.add(&live_vol_row);
 
         let (av_row, av_delay_scale, av_delay_label) =
-            make_labeled_slider_row("Задержка A/V", -500.0, 500.0, 10.0, 0.0, "0 мс");
+            make_labeled_slider_row("Задержка A/V", -500.0, 500.0, 10.0, 0.0, "+0 мс");
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);
@@ -564,7 +717,7 @@ impl ControlPanel {
                 }
             });
         }
-        audio_group.add(&av_row);
+        mix_group.add(&av_row);
 
         let (cf_row, crossfade_scale, crossfade_label) =
             make_labeled_slider_row("Кроссфейд", 10.0, 30.0, 5.0, 20.0, "20 мс");
@@ -580,16 +733,20 @@ impl ControlPanel {
                 }
             });
         }
-        audio_group.add(&cf_row);
-        content.append(&audio_group);
+        mix_group.add(&cf_row);
+        audio_box.append(&mix_group);
 
-        // --- Group 4: Loop Playback & Return Point ---
+        stack.add_named(&wrap_scroll(&audio_box), Some("audio"));
+
+        // === Page 4: Петля и лаг (Loop Playback + Bad Internet Mode) ===
+        let effects_box = make_tab_page_box();
+
         let loop_group = adw::PreferencesGroup::builder()
             .title("Зацикленное видео")
             .build();
         let ping_pong_switch = adw::SwitchRow::builder()
             .title("Реверс-петля (вперёд ↔ назад)")
-            .subtitle("В конце видео проигрывается в реверсе, затем снова вперёд")
+            .subtitle("Бесшовный откат видео в конце вместо скачка")
             .active(false)
             .build();
         {
@@ -611,10 +768,13 @@ impl ControlPanel {
                 "Переходить к сохранённой метке",
             ]))
             .build();
-        let bookmark_label = gtk4::Label::new(Some("Метка: 00:00"));
-        bookmark_label.add_css_class("dim-label");
+        let bookmark_label = gtk4::Label::new(Some("00:00"));
+        bookmark_label.add_css_class("cyanide-kbd-chip");
         bookmark_label.add_css_class("numeric");
-        let set_bm_btn = gtk4::Button::with_label("Запомнить текущий кадр");
+        bookmark_label.set_valign(gtk4::Align::Center);
+        let set_bm_btn = gtk4::Button::with_label("Запомнить");
+        set_bm_btn.set_valign(gtk4::Align::Center);
+        set_bm_btn.set_tooltip_text(Some("Запомнить текущий кадр MP4 как точку возврата"));
         {
             let act = Rc::clone(&on_action);
             set_bm_btn.connect_clicked(move |_| act(UiAction::SetReturnBookmarkCurrent));
@@ -640,21 +800,20 @@ impl ControlPanel {
         loop_group.add(&ping_pong_switch);
         loop_group.add(&return_combo);
         loop_group.add(&bm_row);
-        content.append(&loop_group);
+        effects_box.append(&loop_group);
 
-        // --- Group 5: Bad Internet / Lag Simulation Mode ---
         let lag_cfg = Rc::new(Cell::new(LagConfig::default()));
         let lag_group = adw::PreferencesGroup::builder()
             .title("Режим плохого интернета")
             .build();
         let lag_switch = adw::SwitchRow::builder()
             .title("Случайные подвисания")
-            .subtitle("Добавляет подвисания в live и записанное видео")
+            .subtitle("Периодические фризы в live и записанном видео")
             .active(false)
             .build();
         let lag_on_switch_row = adw::SwitchRow::builder()
-            .title("Подвисание при смене камеры")
-            .subtitle("Обязательный лаг при переключении Loop ↔ Live")
+            .title("Подвисание при смене режима")
+            .subtitle("Короткий фриз при переключении Loop ↔ Live")
             .active(false)
             .build();
         let (lag_int_row, lag_interval_scale, lag_interval_label) =
@@ -755,17 +914,20 @@ impl ControlPanel {
         lag_group.add(&lag_int_row);
         lag_group.add(&lag_min_row);
         lag_group.add(&lag_max_row);
-        content.append(&lag_group);
+        effects_box.append(&lag_group);
 
-        let widget = gtk4::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .min_content_width(370)
-            .child(&content)
-            .build();
+        stack.add_named(&wrap_scroll(&effects_box), Some("effects"));
+        widget.append(&stack);
 
         Self {
             widget,
             syncing,
+            out_picture,
+            monitor_screen,
+            monitor_badge,
+            preset_loop_btn,
+            preset_live_btn,
+            quick_mic_btn,
             video_loop_btn,
             video_live_btn,
             audio_combo,
@@ -782,10 +944,15 @@ impl ControlPanel {
             res_combo,
             fps_combo,
             loop_vol_scale,
+            loop_vol_label,
             live_vol_scale,
+            live_vol_label,
             loop_meter,
+            loop_db_label,
             live_meter,
+            live_db_label,
             out_meter,
+            out_db_label,
             av_delay_scale,
             av_delay_label,
             crossfade_scale,
@@ -795,10 +962,13 @@ impl ControlPanel {
             ping_pong_switch,
             lag_switch,
             lag_on_switch_row,
+            lag_int_row,
             lag_interval_scale,
             lag_interval_label,
+            lag_min_row,
             lag_min_scale,
             lag_min_label,
+            lag_max_row,
             lag_max_scale,
             lag_max_label,
             lag_cfg,
@@ -806,6 +976,10 @@ impl ControlPanel {
             virt_cam_paths,
             real_mic_backing,
         }
+    }
+
+    pub fn bind_output_paintable(&self, out_p: Option<gdk::Paintable>) {
+        self.out_picture.set_paintable(out_p.as_ref());
     }
 
     pub fn sync_state(
@@ -816,6 +990,53 @@ impl ControlPanel {
         hotkey_error: Option<&str>,
     ) {
         let prev = self.syncing.replace(true);
+
+        // Program monitor status styling
+        for cls in ["live", "loop", "custom", "recording"] {
+            self.monitor_badge.remove_css_class(cls);
+            self.monitor_screen.remove_css_class(cls);
+        }
+        let (badge_text, badge_cls) = if state.recording {
+            ("● ЗАПИСЬ", "recording")
+        } else {
+            match state.mode {
+                StreamMode::Live => ("● LIVE", "live"),
+                StreamMode::Loop => ("● LOOP", "loop"),
+                StreamMode::Custom { video, .. } => match video {
+                    VideoSource::Live => ("● CUSTOM · LIVE", "custom"),
+                    VideoSource::Loop => ("● CUSTOM · LOOP", "custom"),
+                },
+            }
+        };
+        self.monitor_badge.set_label(badge_text);
+        self.monitor_badge.add_css_class(badge_cls);
+        self.monitor_screen.add_css_class(badge_cls);
+
+        match state.mode {
+            StreamMode::Loop => {
+                self.preset_loop_btn.add_css_class("suggested-action");
+                self.preset_live_btn.remove_css_class("suggested-action");
+            }
+            StreamMode::Live => {
+                self.preset_live_btn.add_css_class("suggested-action");
+                self.preset_loop_btn.remove_css_class("suggested-action");
+            }
+            StreamMode::Custom { .. } => {
+                self.preset_loop_btn.remove_css_class("suggested-action");
+                self.preset_live_btn.remove_css_class("suggested-action");
+            }
+        }
+
+        self.quick_mic_btn.set_active(state.virtual_mic_enabled);
+        if state.virtual_mic_enabled {
+            self.quick_mic_btn
+                .set_icon_name("audio-input-microphone-symbolic");
+            self.quick_mic_btn.remove_css_class("destructive-action");
+        } else {
+            self.quick_mic_btn
+                .set_icon_name("microphone-sensitivity-muted-symbolic");
+            self.quick_mic_btn.add_css_class("destructive-action");
+        }
 
         match state.mode.video() {
             VideoSource::Loop => self.video_loop_btn.set_active(true),
@@ -841,7 +1062,7 @@ impl ControlPanel {
         let hk_subtitle = match hotkey_error {
             Some(err) => err,
             None if cfg.hotkey.is_some() => "Активен для Loop ↔ Live",
-            None => "Нажмите «Записать» или введите, напр. SUPER+F8",
+            None => "Нажмите «Задать» или введите, напр. SUPER+F8",
         };
         self.hotkey_row.set_subtitle(hk_subtitle);
 
@@ -898,7 +1119,11 @@ impl ControlPanel {
         self.fps_combo.set_selected(fps_idx);
 
         self.loop_vol_scale.set_value(cfg.loop_volume);
+        self.loop_vol_label
+            .set_label(&format!("{}%", (cfg.loop_volume * 100.0).round() as u32));
         self.live_vol_scale.set_value(cfg.live_volume);
+        self.live_vol_label
+            .set_label(&format!("{}%", (cfg.live_volume * 100.0).round() as u32));
         self.av_delay_scale.set_value(cfg.av_delay_ms as f64);
         self.av_delay_label
             .set_label(&format!("{:+} мс", cfg.av_delay_ms));
@@ -914,12 +1139,16 @@ impl ControlPanel {
         self.return_combo.set_selected(ret_idx);
         let secs = bm_ms / 1000;
         self.bookmark_label
-            .set_label(&format!("Метка: {:02}:{:02}", secs / 60, secs % 60));
+            .set_label(&format!("{:02}:{:02}", secs / 60, secs % 60));
         self.ping_pong_switch.set_active(cfg.loop_ping_pong);
 
         self.lag_cfg.set(cfg.lag);
         self.lag_switch.set_active(cfg.lag.enabled);
         self.lag_on_switch_row.set_active(cfg.lag.freeze_on_switch);
+        self.lag_int_row.set_sensitive(cfg.lag.enabled);
+        let any_lag = cfg.lag.enabled || cfg.lag.freeze_on_switch;
+        self.lag_min_row.set_sensitive(any_lag);
+        self.lag_max_row.set_sensitive(any_lag);
         self.lag_interval_scale
             .set_value(cfg.lag.interval_ms as f64);
         self.lag_interval_label
@@ -936,8 +1165,11 @@ impl ControlPanel {
 
     pub fn update_levels(&self, levels: &AudioLevels) {
         self.loop_meter.set_value(db_to_unit(levels.loop_db));
+        self.loop_db_label.set_label(&format_db(levels.loop_db));
         self.live_meter.set_value(db_to_unit(levels.live_db));
+        self.live_db_label.set_label(&format_db(levels.live_db));
         self.out_meter.set_value(db_to_unit(levels.out_db));
+        self.out_db_label.set_label(&format_db(levels.out_db));
     }
 
     pub fn update_recording_ui(&self, recording: bool, saving: bool, elapsed_ms: u64) {
@@ -966,8 +1198,72 @@ impl ControlPanel {
     }
 }
 
+fn make_tab_button(label: &str, group: Option<&gtk4::ToggleButton>) -> gtk4::ToggleButton {
+    let btn = gtk4::ToggleButton::with_label(label);
+    btn.add_css_class("cyanide-tab-btn");
+    if let Some(g) = group {
+        btn.set_group(Some(g));
+    }
+    btn
+}
+
+fn make_tab_page_box() -> gtk4::Box {
+    gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(2)
+        .margin_bottom(6)
+        .margin_start(1)
+        .margin_end(1)
+        .build()
+}
+
+fn wrap_scroll(child: &gtk4::Box) -> gtk4::ScrolledWindow {
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .child(child)
+        .build()
+}
+
+fn make_vu_channel(title: &str) -> (gtk4::Box, gtk4::LevelBar, gtk4::Label) {
+    let container = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
+    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let title_lbl = gtk4::Label::new(Some(title));
+    title_lbl.set_xalign(0.0);
+    title_lbl.set_hexpand(true);
+    title_lbl.add_css_class("caption");
+    let db_lbl = gtk4::Label::new(Some("-∞"));
+    db_lbl.add_css_class("caption");
+    db_lbl.add_css_class("numeric");
+    db_lbl.add_css_class("dim-label");
+    db_lbl.set_width_chars(6);
+    db_lbl.set_xalign(1.0);
+    top.append(&title_lbl);
+    top.append(&db_lbl);
+
+    let bar = gtk4::LevelBar::builder()
+        .min_value(0.0)
+        .max_value(1.0)
+        .hexpand(true)
+        .build();
+    bar.add_css_class("cyanide-vu-bar");
+
+    container.append(&top);
+    container.append(&bar);
+    (container, bar, db_lbl)
+}
+
 fn db_to_unit(db: f64) -> f64 {
     ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+fn format_db(db: f64) -> String {
+    if !db.is_finite() || db <= -59.5 {
+        "-∞".into()
+    } else {
+        format!("{:.0} дБ", db.clamp(-60.0, 0.0))
+    }
 }
 
 fn sync_combo(
@@ -1009,22 +1305,6 @@ fn sync_mic_combo(
     }
 }
 
-fn make_slider_row(
-    title: &str,
-    min: f64,
-    max: f64,
-    step: f64,
-    initial: f64,
-) -> (adw::ActionRow, gtk4::Scale) {
-    let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, min, max, step);
-    scale.set_value(initial);
-    scale.set_width_request(150);
-    scale.set_draw_value(false);
-    let row = adw::ActionRow::builder().title(title).build();
-    row.add_suffix(&scale);
-    (row, scale)
-}
-
 fn make_labeled_slider_row(
     title: &str,
     min: f64,
@@ -1035,28 +1315,18 @@ fn make_labeled_slider_row(
 ) -> (adw::ActionRow, gtk4::Scale, gtk4::Label) {
     let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, min, max, step);
     scale.set_value(initial);
-    scale.set_width_request(130);
+    scale.set_width_request(125);
     scale.set_draw_value(false);
     let label = gtk4::Label::new(Some(initial_text));
     label.set_width_chars(7);
+    label.set_xalign(1.0);
+    label.add_css_class("caption");
     label.add_css_class("numeric");
     label.add_css_class("dim-label");
     let row = adw::ActionRow::builder().title(title).build();
     row.add_suffix(&label);
     row.add_suffix(&scale);
     (row, scale, label)
-}
-
-fn make_meter_row(title: &str) -> (adw::ActionRow, gtk4::LevelBar) {
-    let bar = gtk4::LevelBar::builder()
-        .min_value(0.0)
-        .max_value(1.0)
-        .width_request(150)
-        .valign(gtk4::Align::Center)
-        .build();
-    let row = adw::ActionRow::builder().title(title).build();
-    row.add_suffix(&bar);
-    (row, bar)
 }
 
 pub(crate) fn compute_combo_entries(

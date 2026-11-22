@@ -13,7 +13,9 @@ use cyanide::config::{Config, LoopReturnPolicy};
 use cyanide::devices::{
     self, DeviceInventory, VIRTUAL_MIC_NAME, VIRTUAL_SINK_NAME, VirtualMicGuard, modprobe_hint,
 };
-use cyanide::gui::overlay::OverlayWindow;
+use cyanide::gui::overlay::{
+    DEFAULT_OVERLAY_OPACITY, DEFAULT_OVERLAY_SIZE, OverlayMetrics, OverlayWindow,
+};
 use cyanide::gui::{ConfigPatch, MainWindow, UiAction};
 use cyanide::hotkey::{Hotkey, HotkeyManager};
 use cyanide::ipc::{self, IpcRequest, IpcServerHandle};
@@ -184,6 +186,8 @@ struct AppController {
     hotkey_error: Option<String>,
     window: Option<MainWindow>,
     overlay: Option<OverlayWindow>,
+    overlay_id: u64,
+    overlay_metrics: OverlayMetrics,
     save_timer: Option<glib::SourceId>,
     timecode_timer: Option<glib::SourceId>,
     shutting_down: bool,
@@ -388,6 +392,13 @@ fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
     let app = ctrl.borrow().app.clone();
     let weak_act = Rc::downgrade(ctrl);
     let on_action: Rc<dyn Fn(UiAction)> = Rc::new(move |action| {
+        if matches!(action, UiAction::ToggleOverlay(_))
+            && let Some(c) = weak_act.upgrade()
+            && c.try_borrow_mut().is_ok()
+        {
+            handle_ui_action(&c, action);
+            return;
+        }
         let weak_cb = weak_act.clone();
         glib::idle_add_local_once(move || {
             if let Some(c) = weak_cb.upgrade() {
@@ -415,12 +426,48 @@ fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
     }
 }
 
-fn ensure_overlay(ctrl: &Rc<RefCell<AppController>>) {
-    if ctrl.borrow().overlay.is_some() {
-        return;
+fn should_clear_overlay(current_id: u64, closed_id: u64) -> bool {
+    current_id == closed_id
+}
+
+fn handle_overlay_closed(
+    ctrl: &Rc<RefCell<AppController>>,
+    closed_id: u64,
+    metrics: OverlayMetrics,
+) {
+    let mut c = ctrl.borrow_mut();
+    c.overlay_metrics = metrics;
+    if should_clear_overlay(c.overlay_id, closed_id) {
+        c.overlay = None;
+    }
+    c.sync_previews_active();
+    c.sync_window();
+}
+
+fn open_overlay(ctrl: &Rc<RefCell<AppController>>) {
+    // If an active overlay is already visible, simply bring it to front.
+    let stale = {
+        let mut c = ctrl.borrow_mut();
+        if c.overlay.as_ref().is_some_and(OverlayWindow::is_visible) {
+            drop(c);
+            if let Some(ref ov) = ctrl.borrow().overlay {
+                ov.present();
+            }
+            return;
+        }
+        c.overlay.take()
+    };
+    if let Some(old) = stale {
+        let metrics = old.close_and_destroy();
+        ctrl.borrow_mut().overlay_metrics = metrics;
     }
 
-    let app = ctrl.borrow().app.clone();
+    let (app, metrics, overlay_id) = {
+        let mut c = ctrl.borrow_mut();
+        c.overlay_id = c.overlay_id.wrapping_add(1);
+        (c.app.clone(), c.overlay_metrics, c.overlay_id)
+    };
+
     let weak_act = Rc::downgrade(ctrl);
     let on_action: Rc<dyn Fn(UiAction)> = Rc::new(move |action| {
         let weak_cb = weak_act.clone();
@@ -431,35 +478,60 @@ fn ensure_overlay(ctrl: &Rc<RefCell<AppController>>) {
         });
     });
 
-    let weak_vis = Rc::downgrade(ctrl);
-    let on_visibility: Rc<dyn Fn(bool)> = Rc::new(move |_visible| {
-        let weak_cb = weak_vis.clone();
+    let weak_close = Rc::downgrade(ctrl);
+    let on_closed: Rc<dyn Fn(OverlayMetrics)> = Rc::new(move |closed_metrics| {
+        if let Some(c) = weak_close.upgrade()
+            && c.try_borrow_mut().is_ok()
+        {
+            handle_overlay_closed(&c, overlay_id, closed_metrics);
+            return;
+        }
+        let weak_cb = weak_close.clone();
         glib::idle_add_local_once(move || {
             if let Some(c) = weak_cb.upgrade() {
-                let inner = c.borrow();
-                inner.sync_previews_active();
-                inner.sync_window();
+                handle_overlay_closed(&c, overlay_id, closed_metrics);
             }
         });
     });
 
-    let ov = OverlayWindow::new(&app, on_action, on_visibility);
+    let ov = OverlayWindow::new(&app, metrics, on_action, on_closed);
     {
         let mut c = ctrl.borrow_mut();
         c.overlay = Some(ov);
         c.bind_pipeline_paintables();
+        if let Some(ref ov) = c.overlay {
+            ov.sync_state(&c.config, &c.state);
+            if let Some(ref pipe) = c.pipeline {
+                ov.set_similarity(pipe.similarity());
+            }
+        }
+    }
+
+    // Present outside any RefCell borrow so GTK/Wayland signals cannot re-entrantly panic.
+    if let Some(ref ov) = ctrl.borrow().overlay {
+        ov.present();
+    }
+    let c = ctrl.borrow();
+    c.sync_previews_active();
+    c.sync_window();
+}
+
+fn close_overlay(ctrl: &Rc<RefCell<AppController>>) {
+    let existing = ctrl.borrow_mut().overlay.take();
+    if let Some(ov) = existing {
+        let metrics = ov.close_and_destroy();
+        let mut c = ctrl.borrow_mut();
+        c.overlay_metrics = metrics;
+        c.sync_previews_active();
         c.sync_window();
     }
 }
 
 fn set_overlay_visible(ctrl: &Rc<RefCell<AppController>>, visible: bool) {
     if visible {
-        ensure_overlay(ctrl);
-        if let Some(ref ov) = ctrl.borrow().overlay {
-            ov.present();
-        }
-    } else if let Some(ref ov) = ctrl.borrow().overlay {
-        ov.hide();
+        open_overlay(ctrl);
+    } else {
+        close_overlay(ctrl);
     }
 }
 
@@ -705,6 +777,12 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
         UiAction::ToggleOverlay(visible) => {
             set_overlay_visible(ctrl, visible);
         }
+        UiAction::RefreshOverlay => {
+            let c = ctrl.borrow();
+            if let Some(ref ov) = c.overlay {
+                ov.sync_state(&c.config, &c.state);
+            }
+        }
         UiAction::SetHotkeyCapture(capturing) => {
             ctrl.borrow_mut().hotkey_manager.set_suspended(capturing);
         }
@@ -862,12 +940,15 @@ fn shutdown_controller(ctrl: &Rc<RefCell<AppController>>) {
             server.shutdown();
         }
         let _ = c.hotkey_manager.apply(None);
-        c.overlay.take();
+        let overlay = c.overlay.take();
         c.window.take();
         c.hold.take();
-        c.app.clone()
+        (c.app.clone(), overlay)
     };
-    app.quit();
+    if let Some(ov) = app.1 {
+        let _ = ov.close_and_destroy();
+    }
+    app.0.quit();
 }
 
 fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
@@ -968,6 +1049,11 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
             hotkey_error: None,
             window: None,
             overlay: None,
+            overlay_id: 0,
+            overlay_metrics: OverlayMetrics {
+                size: DEFAULT_OVERLAY_SIZE,
+                opacity: DEFAULT_OVERLAY_OPACITY,
+            },
             save_timer: None,
             timecode_timer: None,
             shutting_down: false,
@@ -1019,11 +1105,11 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
                     .unwrap_or_else(|| "Нет MP4".into());
                 let pos = c.state.loop_pos_ms;
                 let dur = c.state.loop_dur_ms;
-                let fps = c.config.video.fps;
                 let reversed = c
                     .pipeline
                     .as_ref()
                     .is_some_and(MediaPipeline::is_loop_reversed);
+                let similarity = c.pipeline.as_ref().map(MediaPipeline::similarity);
                 if c.state.recording
                     && let Some(elapsed) = c
                         .pipeline
@@ -1036,7 +1122,10 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
                 let saving = c.state.recording_saving;
                 let rec_ms = c.state.recording_elapsed_ms;
                 if let Some(ref win) = c.window {
-                    win.update_timecode(&fname, pos, dur, fps, reversed);
+                    win.update_timecode(&fname, pos, dur, reversed);
+                    if let Some(sim) = similarity {
+                        win.update_similarity(sim);
+                    }
                     if rec {
                         win.update_recording_timer(rec, saving, rec_ms);
                     }
@@ -1166,5 +1255,11 @@ mod tests {
         assert!(!fb.live_video_black);
         assert!(!fb.live_audio_silence);
         assert_eq!(cfg.virtual_camera.as_deref(), Some("/dev/video10"));
+    }
+
+    #[test]
+    fn overlay_generation_guard_ignores_stale_close_events() {
+        assert!(should_clear_overlay(1, 1));
+        assert!(!should_clear_overlay(2, 1));
     }
 }

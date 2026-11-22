@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::graphene;
+use gtk4::gsk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
@@ -85,21 +86,41 @@ impl BoundPaintable {
     }
 }
 
-type SplitCallback = Box<dyn Fn(f64)>;
+type ConfigCallback = Box<dyn Fn(CompareConfig)>;
 
 mod imp {
     use super::*;
 
-    #[derive(Default)]
     pub struct CompareView {
         pub(super) loop_bound: RefCell<Option<BoundPaintable>>,
         pub(super) live_bound: RefCell<Option<BoundPaintable>>,
         pub(super) frozen_frame: RefCell<Option<gdk::Paintable>>,
         pub(super) cfg: Cell<CompareConfig>,
+        pub(super) interactive: Cell<bool>,
         pub(super) highlight_match: Cell<bool>,
         pub(super) similarity: Cell<f32>,
         pub(super) drag_start_x: Cell<f64>,
-        pub(super) on_split_changed: RefCell<Option<SplitCallback>>,
+        pub(super) pan_start_x: Cell<f64>,
+        pub(super) pan_start_y: Cell<f64>,
+        pub(super) on_config_changed: RefCell<Option<ConfigCallback>>,
+    }
+
+    impl Default for CompareView {
+        fn default() -> Self {
+            Self {
+                loop_bound: RefCell::new(None),
+                live_bound: RefCell::new(None),
+                frozen_frame: RefCell::new(None),
+                cfg: Cell::new(CompareConfig::default()),
+                interactive: Cell::new(true),
+                highlight_match: Cell::new(false),
+                similarity: Cell::new(0.0),
+                drag_start_x: Cell::new(0.0),
+                pan_start_x: Cell::new(0.0),
+                pan_start_y: Cell::new(0.0),
+                on_config_changed: RefCell::new(None),
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -117,30 +138,95 @@ mod imp {
             widget.set_vexpand(true);
             widget.set_overflow(gtk4::Overflow::Hidden);
 
+            // Drag: moves split divider in Split mode, or pans when zoomed in other modes.
             let drag = gtk4::GestureDrag::new();
             let weak_begin = widget.downgrade();
             drag.connect_drag_begin(move |_, start_x, _| {
                 let Some(w) = weak_begin.upgrade() else {
                     return;
                 };
-                if w.imp().cfg.get().mode != CompareMode::Split {
+                if !w.imp().interactive.get() {
                     return;
                 }
+                let cfg = w.imp().cfg.get();
                 w.imp().drag_start_x.set(start_x);
-                w.update_split_from_x(start_x);
+                w.imp().pan_start_x.set(cfg.pan_x);
+                w.imp().pan_start_y.set(cfg.pan_y);
+                if cfg.mode == CompareMode::Split {
+                    w.update_split_from_x(start_x);
+                }
             });
             let weak_update = widget.downgrade();
-            drag.connect_drag_update(move |_, offset_x, _| {
+            drag.connect_drag_update(move |_, offset_x, offset_y| {
                 let Some(w) = weak_update.upgrade() else {
                     return;
                 };
-                if w.imp().cfg.get().mode != CompareMode::Split {
+                if !w.imp().interactive.get() {
                     return;
                 }
-                let x = w.imp().drag_start_x.get() + offset_x;
-                w.update_split_from_x(x);
+                let cfg = w.imp().cfg.get();
+                if cfg.mode == CompareMode::Split {
+                    let x = w.imp().drag_start_x.get() + offset_x;
+                    w.update_split_from_x(x);
+                } else if cfg.zoom > 1.01 {
+                    w.update_pan_from_offset(offset_x, offset_y);
+                }
             });
             widget.add_controller(drag);
+
+            // Mouse wheel scroll to zoom directly on the canvas.
+            let scroll =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            let weak_scroll = widget.downgrade();
+            scroll.connect_scroll(move |_, _, dy| {
+                let Some(w) = weak_scroll.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if !w.imp().interactive.get() {
+                    return glib::Propagation::Proceed;
+                }
+                let mut cfg = w.imp().cfg.get();
+                let step = if dy < 0.0 { 0.15 } else { -0.15 };
+                let next_zoom = (cfg.zoom + step).clamp(1.0, 3.0);
+                if (next_zoom - cfg.zoom).abs() < 0.001 {
+                    return glib::Propagation::Stop;
+                }
+                cfg.zoom = next_zoom;
+                if cfg.zoom <= 1.001 {
+                    cfg.zoom = 1.0;
+                    cfg.pan_x = 0.0;
+                    cfg.pan_y = 0.0;
+                }
+                w.apply_interactive_config(cfg);
+                glib::Propagation::Stop
+            });
+            widget.add_controller(scroll);
+
+            // Double-click resets zoom and pan.
+            let click = gtk4::GestureClick::new();
+            let weak_click = widget.downgrade();
+            click.connect_pressed(move |_, n_press, _, _| {
+                if n_press != 2 {
+                    return;
+                }
+                let Some(w) = weak_click.upgrade() else {
+                    return;
+                };
+                if !w.imp().interactive.get() {
+                    return;
+                }
+                let mut cfg = w.imp().cfg.get();
+                if (cfg.zoom - 1.0).abs() > 0.001
+                    || cfg.pan_x.abs() > 0.001
+                    || cfg.pan_y.abs() > 0.001
+                {
+                    cfg.zoom = 1.0;
+                    cfg.pan_x = 0.0;
+                    cfg.pan_y = 0.0;
+                    w.apply_interactive_config(cfg);
+                }
+            });
+            widget.add_controller(click);
         }
 
         fn dispose(&self) {
@@ -165,7 +251,7 @@ mod imp {
 
             let bounds = graphene::Rect::new(0.0, 0.0, w, h);
             snapshot.push_clip(&bounds);
-            snapshot.append_color(&gdk::RGBA::new(0.09, 0.09, 0.11, 1.0), &bounds);
+            snapshot.append_color(&gdk::RGBA::new(0.043, 0.051, 0.071, 1.0), &bounds);
 
             let cfg = self.cfg.get();
             let frozen = self.frozen_frame.borrow().clone();
@@ -201,7 +287,7 @@ mod imp {
                         draw_transformed(snapshot, lv, (half, 0.0, w - half, h), &cfg);
                     }
                     let divider = graphene::Rect::new(half - 1.0, 0.0, 2.0, h);
-                    snapshot.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.35), &divider);
+                    snapshot.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.22), &divider);
                 }
                 CompareMode::Split => {
                     let (left, right) = split_clip_rects(w, h, cfg.split_pos as f32);
@@ -217,10 +303,7 @@ mod imp {
                         draw_transformed(snapshot, lv, (0.0, 0.0, w, h), &cfg);
                         snapshot.pop();
                     }
-                    let line = graphene::Rect::new(left.2 - 1.0, 0.0, 2.0, h);
-                    snapshot.append_color(&gdk::RGBA::new(0.25, 0.78, 1.0, 0.95), &line);
-                    let handle = graphene::Rect::new(left.2 - 5.0, h * 0.5 - 20.0, 10.0, 40.0);
-                    snapshot.append_color(&gdk::RGBA::new(0.25, 0.78, 1.0, 0.95), &handle);
+                    draw_split_handle(snapshot, left.2, h);
                 }
             }
 
@@ -230,14 +313,14 @@ mod imp {
                 0.0
             };
             if green > 0.0 {
-                snapshot.append_color(&gdk::RGBA::new(0.08, 0.88, 0.35, 0.30 * green), &bounds);
+                snapshot.append_color(&gdk::RGBA::new(0.08, 0.88, 0.35, 0.24 * green), &bounds);
             }
 
             draw_overlays(snapshot, w, h, &cfg, green);
 
             if green > 0.0 {
-                let border = gdk::RGBA::new(0.15, 0.95, 0.42, 0.95 * green);
-                let t = 4.0f32;
+                let border = gdk::RGBA::new(0.18, 0.94, 0.46, 0.92 * green);
+                let t = 3.5f32;
                 snapshot.append_color(&border, &graphene::Rect::new(0.0, 0.0, w, t));
                 snapshot.append_color(&border, &graphene::Rect::new(0.0, h - t, w, t));
                 snapshot.append_color(
@@ -269,6 +352,10 @@ impl Default for CompareView {
 impl CompareView {
     pub fn new() -> Self {
         glib::Object::builder().build()
+    }
+
+    pub fn set_interactive(&self, interactive: bool) {
+        self.imp().interactive.set(interactive);
     }
 
     pub fn set_paintables(&self, loop_p: Option<gdk::Paintable>, live_p: Option<gdk::Paintable>) {
@@ -318,8 +405,16 @@ impl CompareView {
         self.imp().frozen_frame.borrow().is_some()
     }
 
-    pub fn connect_split_changed(&self, f: impl Fn(f64) + 'static) {
-        *self.imp().on_split_changed.borrow_mut() = Some(Box::new(f));
+    pub fn connect_config_changed(&self, f: impl Fn(CompareConfig) + 'static) {
+        *self.imp().on_config_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    fn apply_interactive_config(&self, cfg: CompareConfig) {
+        self.imp().cfg.set(cfg);
+        self.queue_draw();
+        if let Some(cb) = self.imp().on_config_changed.borrow().as_ref() {
+            cb(cfg);
+        }
     }
 
     fn update_split_from_x(&self, x: f64) {
@@ -330,11 +425,18 @@ impl CompareView {
         let ratio = (x / w).clamp(0.05, 0.95);
         let mut cfg = self.imp().cfg.get();
         cfg.split_pos = ratio;
-        self.imp().cfg.set(cfg);
-        self.queue_draw();
-        if let Some(cb) = self.imp().on_split_changed.borrow().as_ref() {
-            cb(ratio);
-        }
+        self.apply_interactive_config(cfg);
+    }
+
+    fn update_pan_from_offset(&self, offset_x: f64, offset_y: f64) {
+        let w = (self.width() as f64).max(1.0);
+        let h = (self.height() as f64).max(1.0);
+        let mut cfg = self.imp().cfg.get();
+        let dx = (offset_x / (w * 0.5)).clamp(-2.0, 2.0);
+        let dy = (offset_y / (h * 0.5)).clamp(-2.0, 2.0);
+        cfg.pan_x = (self.imp().pan_start_x.get() + dx).clamp(-1.0, 1.0);
+        cfg.pan_y = (self.imp().pan_start_y.get() + dy).clamp(-1.0, 1.0);
+        self.apply_interactive_config(cfg);
     }
 
     fn rebind_slot(
@@ -366,6 +468,31 @@ impl CompareView {
             size_sig,
         });
     }
+}
+
+fn draw_split_handle(snapshot: &gtk4::Snapshot, split_x: f32, h: f32) {
+    // Subtle dark shadow behind line for legibility on bright video.
+    let shadow = graphene::Rect::new(split_x - 2.0, 0.0, 4.0, h);
+    snapshot.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.40), &shadow);
+
+    let line = graphene::Rect::new(split_x - 1.0, 0.0, 2.0, h);
+    snapshot.append_color(&gdk::RGBA::new(0.22, 0.74, 0.97, 0.95), &line);
+
+    let pill_rect = graphene::Rect::new(split_x - 7.0, h * 0.5 - 22.0, 14.0, 44.0);
+    let rounded = gsk::RoundedRect::from_rect(pill_rect, 7.0);
+    snapshot.push_rounded_clip(&rounded);
+    snapshot.append_color(&gdk::RGBA::new(0.08, 0.11, 0.16, 0.92), &pill_rect);
+    let inner = graphene::Rect::new(split_x - 5.0, h * 0.5 - 20.0, 10.0, 40.0);
+    let inner_rounded = gsk::RoundedRect::from_rect(inner, 5.0);
+    snapshot.push_rounded_clip(&inner_rounded);
+    snapshot.append_color(&gdk::RGBA::new(0.22, 0.74, 0.97, 0.94), &inner);
+    // Subtle dark center grip bars.
+    for dy in [-6.0f32, 0.0, 6.0] {
+        let grip = graphene::Rect::new(split_x - 2.5, h * 0.5 + dy - 0.75, 5.0, 1.5);
+        snapshot.append_color(&gdk::RGBA::new(0.04, 0.10, 0.16, 0.75), &grip);
+    }
+    snapshot.pop();
+    snapshot.pop();
 }
 
 fn draw_transformed(
@@ -418,14 +545,14 @@ fn draw_overlays(snapshot: &gtk4::Snapshot, w: f32, h: f32, cfg: &CompareConfig,
         idx += 4;
     }
     if cfg.show_center {
-        let color = gdk::RGBA::new(0.2, 0.85, 1.0, 0.7);
+        let color = gdk::RGBA::new(0.22, 0.84, 1.0, 0.68);
         for &(x, y, sw, sh) in &segs[idx..idx + 2] {
             snapshot.append_color(&color, &graphene::Rect::new(x, y, sw, sh));
         }
         idx += 2;
     }
     if cfg.show_guides {
-        let color = gdk::RGBA::new(1.0, 0.75, 0.15, 0.85);
+        let color = gdk::RGBA::new(1.0, 0.76, 0.18, 0.85);
         for &(x, y, sw, sh) in &segs[idx..idx + 2] {
             snapshot.append_color(&color, &graphene::Rect::new(x, y, sw, sh));
         }
