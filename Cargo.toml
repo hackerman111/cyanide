@@ -1,6 +1,6 @@
 [package]
 name = "cyanide"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Linux virtual camera and virtual microphone utility with GTK4 comparison UI"
 

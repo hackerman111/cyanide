@@ -25,15 +25,24 @@ policy = "continue"
 mode = "overlay"
 opacity = 0.5
 split_pos = 0.5
+split_vertical = true
 show_grid = false
 show_center = false
 show_guides = false
+similarity = false
 guide_x = 0.5
 guide_y = 0.5
+target = "both"
 mirror = false
 zoom = 1.0
 pan_x = 0.0
 pan_y = 0.0
+
+[ui]
+window_width = 1366
+window_height = 768
+split_position = 860
+sidebar_visible = true
 
 [lag]
 enabled = false

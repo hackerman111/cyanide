@@ -7,7 +7,7 @@ use gtk4::gsk;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-use crate::config::{CompareConfig, CompareMode};
+use crate::config::{CompareConfig, CompareMode, CompareTarget, LayerTransform};
 
 pub type Rect4 = (f32, f32, f32, f32);
 
@@ -34,9 +34,18 @@ pub fn fit_aspect_rect(bounds: (f32, f32), aspect: f32) -> Rect4 {
 }
 
 pub fn split_clip_rects(w: f32, h: f32, ratio: f32) -> (Rect4, Rect4) {
+    split_clip_rects_oriented(w, h, ratio, true)
+}
+
+pub fn split_clip_rects_oriented(w: f32, h: f32, ratio: f32, vertical: bool) -> (Rect4, Rect4) {
     let clamped = ratio.clamp(0.05, 0.95);
-    let split_x = w * clamped;
-    ((0.0, 0.0, split_x, h), (split_x, 0.0, w - split_x, h))
+    if vertical {
+        let split_x = w * clamped;
+        ((0.0, 0.0, split_x, h), (split_x, 0.0, w - split_x, h))
+    } else {
+        let split_y = h * clamped;
+        ((0.0, 0.0, w, split_y), (0.0, split_y, w, h - split_y))
+    }
 }
 
 /// Maps frame similarity `[0.0, 1.0]` to green glow intensity `[0.0, 1.0]`.
@@ -100,6 +109,8 @@ mod imp {
         pub(super) highlight_match: Cell<bool>,
         pub(super) similarity: Cell<f32>,
         pub(super) drag_start_x: Cell<f64>,
+        pub(super) drag_start_y: Cell<f64>,
+        pub(super) dragging_split: Cell<bool>,
         pub(super) pan_start_x: Cell<f64>,
         pub(super) pan_start_y: Cell<f64>,
         pub(super) on_config_changed: RefCell<Option<ConfigCallback>>,
@@ -116,6 +127,8 @@ mod imp {
                 highlight_match: Cell::new(false),
                 similarity: Cell::new(0.0),
                 drag_start_x: Cell::new(0.0),
+                drag_start_y: Cell::new(0.0),
+                dragging_split: Cell::new(false),
                 pan_start_x: Cell::new(0.0),
                 pan_start_y: Cell::new(0.0),
                 on_config_changed: RefCell::new(None),
@@ -137,23 +150,41 @@ mod imp {
             widget.set_hexpand(true);
             widget.set_vexpand(true);
             widget.set_overflow(gtk4::Overflow::Hidden);
+            widget.set_focusable(true);
 
-            // Drag: moves split divider in Split mode, or pans when zoomed in other modes.
+            // Drag: moves split divider in Split mode (near divider or default zoom), or pans active layer.
             let drag = gtk4::GestureDrag::new();
             let weak_begin = widget.downgrade();
-            drag.connect_drag_begin(move |_, start_x, _| {
+            drag.connect_drag_begin(move |_, start_x, start_y| {
                 let Some(w) = weak_begin.upgrade() else {
                     return;
                 };
                 if !w.imp().interactive.get() {
                     return;
                 }
+                w.grab_focus();
                 let cfg = w.imp().cfg.get();
+                let (az, apx, apy, _) = cfg.active_transform();
                 w.imp().drag_start_x.set(start_x);
-                w.imp().pan_start_x.set(cfg.pan_x);
-                w.imp().pan_start_y.set(cfg.pan_y);
-                if cfg.mode == CompareMode::Split {
-                    w.update_split_from_x(start_x);
+                w.imp().drag_start_y.set(start_y);
+                w.imp().pan_start_x.set(apx);
+                w.imp().pan_start_y.set(apy);
+
+                let hit_split = if cfg.mode == CompareMode::Split {
+                    let vw = w.width() as f64;
+                    let vh = w.height() as f64;
+                    let dist = if cfg.split_vertical {
+                        (start_x - vw * cfg.split_pos).abs()
+                    } else {
+                        (start_y - vh * cfg.split_pos).abs()
+                    };
+                    dist <= 28.0 || (cfg.target == CompareTarget::Both && az <= 1.01)
+                } else {
+                    false
+                };
+                w.imp().dragging_split.set(hit_split);
+                if hit_split {
+                    w.update_split_from_pos(start_x, start_y);
                 }
             });
             let weak_update = widget.downgrade();
@@ -165,20 +196,24 @@ mod imp {
                     return;
                 }
                 let cfg = w.imp().cfg.get();
-                if cfg.mode == CompareMode::Split {
+                if w.imp().dragging_split.get() {
                     let x = w.imp().drag_start_x.get() + offset_x;
-                    w.update_split_from_x(x);
-                } else if cfg.zoom > 1.01 {
-                    w.update_pan_from_offset(offset_x, offset_y);
+                    let y = w.imp().drag_start_y.get() + offset_y;
+                    w.update_split_from_pos(x, y);
+                } else {
+                    let (az, _, _, _) = cfg.active_transform();
+                    if cfg.target != CompareTarget::Both || az > 1.01 {
+                        w.update_pan_from_offset(offset_x, offset_y);
+                    }
                 }
             });
             widget.add_controller(drag);
 
-            // Mouse wheel scroll to zoom directly on the canvas.
+            // Mouse wheel: zoom active layer, or Ctrl+Scroll adjusts opacity in Overlay mode.
             let scroll =
                 gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
             let weak_scroll = widget.downgrade();
-            scroll.connect_scroll(move |_, _, dy| {
+            scroll.connect_scroll(move |ctrl, _, dy| {
                 let Some(w) = weak_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
@@ -186,23 +221,45 @@ mod imp {
                     return glib::Propagation::Proceed;
                 }
                 let mut cfg = w.imp().cfg.get();
-                let step = if dy < 0.0 { 0.15 } else { -0.15 };
-                let next_zoom = (cfg.zoom + step).clamp(1.0, 3.0);
-                if (next_zoom - cfg.zoom).abs() < 0.001 {
+                let mods = ctrl.current_event_state();
+                if mods.contains(gdk::ModifierType::CONTROL_MASK)
+                    && cfg.mode == CompareMode::Overlay
+                {
+                    let delta = if dy < 0.0 { 0.05 } else { -0.05 };
+                    let next_op = (cfg.opacity + delta).clamp(0.0, 1.0);
+                    if (next_op - cfg.opacity).abs() < 0.001 {
+                        return glib::Propagation::Stop;
+                    }
+                    cfg.opacity = next_op;
+                    w.apply_interactive_config(cfg);
                     return glib::Propagation::Stop;
                 }
-                cfg.zoom = next_zoom;
-                if cfg.zoom <= 1.001 {
-                    cfg.zoom = 1.0;
-                    cfg.pan_x = 0.0;
-                    cfg.pan_y = 0.0;
+
+                let step = if dy < 0.0 { 0.12 } else { -0.12 };
+                let (zoom, mut px, mut py, mirror) = cfg.active_transform();
+                let (min_z, max_z) = if cfg.target == CompareTarget::Both {
+                    (1.0, 3.0)
+                } else {
+                    (0.5, 3.0)
+                };
+                let next_zoom = (zoom + step).clamp(min_z, max_z);
+                if (next_zoom - zoom).abs() < 0.001 {
+                    return glib::Propagation::Stop;
                 }
+                let final_zoom = if cfg.target == CompareTarget::Both && next_zoom <= 1.001 {
+                    px = 0.0;
+                    py = 0.0;
+                    1.0
+                } else {
+                    next_zoom
+                };
+                cfg.set_active_transform(final_zoom, px, py, mirror);
                 w.apply_interactive_config(cfg);
                 glib::Propagation::Stop
             });
             widget.add_controller(scroll);
 
-            // Double-click resets zoom and pan.
+            // Double-click resets active layer transform.
             let click = gtk4::GestureClick::new();
             let weak_click = widget.downgrade();
             click.connect_pressed(move |_, n_press, _, _| {
@@ -216,17 +273,78 @@ mod imp {
                     return;
                 }
                 let mut cfg = w.imp().cfg.get();
-                if (cfg.zoom - 1.0).abs() > 0.001
-                    || cfg.pan_x.abs() > 0.001
-                    || cfg.pan_y.abs() > 0.001
-                {
-                    cfg.zoom = 1.0;
-                    cfg.pan_x = 0.0;
-                    cfg.pan_y = 0.0;
+                let (zoom, px, py, mirror) = cfg.active_transform();
+                if (zoom - 1.0).abs() > 0.001 || px.abs() > 0.001 || py.abs() > 0.001 || mirror {
+                    cfg.set_active_transform(1.0, 0.0, 0.0, false);
                     w.apply_interactive_config(cfg);
                 }
             });
             widget.add_controller(click);
+
+            // Keyboard panning/zooming when canvas has focus.
+            let key = gtk4::EventControllerKey::new();
+            let weak_key = widget.downgrade();
+            key.connect_key_pressed(move |_, keyval, _, state| {
+                let Some(w) = weak_key.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if !w.imp().interactive.get() {
+                    return glib::Propagation::Proceed;
+                }
+                let mut cfg = w.imp().cfg.get();
+                let step = if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                    0.06
+                } else {
+                    0.02
+                };
+                let (zoom, mut px, mut py, mirror) = cfg.active_transform();
+                match keyval {
+                    gdk::Key::Left => px = (px - step).clamp(-1.0, 1.0),
+                    gdk::Key::Right => px = (px + step).clamp(-1.0, 1.0),
+                    gdk::Key::Up => {
+                        if state.contains(gdk::ModifierType::CONTROL_MASK)
+                            && cfg.mode == CompareMode::Overlay
+                        {
+                            cfg.opacity = (cfg.opacity + 0.05).clamp(0.0, 1.0);
+                            w.apply_interactive_config(cfg);
+                            return glib::Propagation::Stop;
+                        }
+                        py = (py - step).clamp(-1.0, 1.0);
+                    }
+                    gdk::Key::Down => {
+                        if state.contains(gdk::ModifierType::CONTROL_MASK)
+                            && cfg.mode == CompareMode::Overlay
+                        {
+                            cfg.opacity = (cfg.opacity - 0.05).clamp(0.0, 1.0);
+                            w.apply_interactive_config(cfg);
+                            return glib::Propagation::Stop;
+                        }
+                        py = (py + step).clamp(-1.0, 1.0);
+                    }
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+                        let nz = (zoom + 0.1).clamp(0.5, 3.0);
+                        cfg.set_active_transform(nz, px, py, mirror);
+                        w.apply_interactive_config(cfg);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::minus | gdk::Key::KP_Subtract => {
+                        let min_z = if cfg.target == CompareTarget::Both {
+                            1.0
+                        } else {
+                            0.5
+                        };
+                        let nz = (zoom - 0.1).clamp(min_z, 3.0);
+                        cfg.set_active_transform(nz, px, py, mirror);
+                        w.apply_interactive_config(cfg);
+                        return glib::Propagation::Stop;
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
+                cfg.set_active_transform(zoom, px, py, mirror);
+                w.apply_interactive_config(cfg);
+                glib::Propagation::Stop
+            });
+            widget.add_controller(key);
         }
 
         fn dispose(&self) {
@@ -270,40 +388,54 @@ mod imp {
             match cfg.mode {
                 CompareMode::Overlay => {
                     if let Some(ref lp) = loop_p {
-                        draw_transformed(snapshot, lp, (0.0, 0.0, w, h), &cfg);
+                        draw_transformed(snapshot, lp, (0.0, 0.0, w, h), &cfg, cfg.loop_transform);
                     }
                     if let Some(ref lv) = live_p {
                         snapshot.push_opacity(cfg.opacity.clamp(0.0, 1.0));
-                        draw_transformed(snapshot, lv, (0.0, 0.0, w, h), &cfg);
+                        draw_transformed(snapshot, lv, (0.0, 0.0, w, h), &cfg, cfg.live_transform);
                         snapshot.pop();
                     }
                 }
                 CompareMode::SideBySide => {
                     let half = w * 0.5;
                     if let Some(ref lp) = loop_p {
-                        draw_transformed(snapshot, lp, (0.0, 0.0, half, h), &cfg);
+                        draw_transformed(
+                            snapshot,
+                            lp,
+                            (0.0, 0.0, half, h),
+                            &cfg,
+                            cfg.loop_transform,
+                        );
                     }
                     if let Some(ref lv) = live_p {
-                        draw_transformed(snapshot, lv, (half, 0.0, w - half, h), &cfg);
+                        draw_transformed(
+                            snapshot,
+                            lv,
+                            (half, 0.0, w - half, h),
+                            &cfg,
+                            cfg.live_transform,
+                        );
                     }
                     let divider = graphene::Rect::new(half - 1.0, 0.0, 2.0, h);
                     snapshot.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.22), &divider);
                 }
                 CompareMode::Split => {
-                    let (left, right) = split_clip_rects(w, h, cfg.split_pos as f32);
+                    let (first, second) =
+                        split_clip_rects_oriented(w, h, cfg.split_pos as f32, cfg.split_vertical);
                     if let Some(ref lp) = loop_p {
-                        let clip = graphene::Rect::new(left.0, left.1, left.2, left.3);
+                        let clip = graphene::Rect::new(first.0, first.1, first.2, first.3);
                         snapshot.push_clip(&clip);
-                        draw_transformed(snapshot, lp, (0.0, 0.0, w, h), &cfg);
+                        draw_transformed(snapshot, lp, (0.0, 0.0, w, h), &cfg, cfg.loop_transform);
                         snapshot.pop();
                     }
                     if let Some(ref lv) = live_p {
-                        let clip = graphene::Rect::new(right.0, right.1, right.2, right.3);
+                        let clip = graphene::Rect::new(second.0, second.1, second.2, second.3);
                         snapshot.push_clip(&clip);
-                        draw_transformed(snapshot, lv, (0.0, 0.0, w, h), &cfg);
+                        draw_transformed(snapshot, lv, (0.0, 0.0, w, h), &cfg, cfg.live_transform);
                         snapshot.pop();
                     }
-                    draw_split_handle(snapshot, left.2, h);
+                    let split_pos_px = if cfg.split_vertical { first.2 } else { first.3 };
+                    draw_split_handle_oriented(snapshot, w, h, split_pos_px, cfg.split_vertical);
                 }
             }
 
@@ -417,13 +549,21 @@ impl CompareView {
         }
     }
 
-    fn update_split_from_x(&self, x: f64) {
-        let w = self.width() as f64;
-        if w <= 1.0 {
-            return;
-        }
-        let ratio = (x / w).clamp(0.05, 0.95);
+    fn update_split_from_pos(&self, x: f64, y: f64) {
         let mut cfg = self.imp().cfg.get();
+        let ratio = if cfg.split_vertical {
+            let w = self.width() as f64;
+            if w <= 1.0 {
+                return;
+            }
+            (x / w).clamp(0.05, 0.95)
+        } else {
+            let h = self.height() as f64;
+            if h <= 1.0 {
+                return;
+            }
+            (y / h).clamp(0.05, 0.95)
+        };
         cfg.split_pos = ratio;
         self.apply_interactive_config(cfg);
     }
@@ -432,10 +572,12 @@ impl CompareView {
         let w = (self.width() as f64).max(1.0);
         let h = (self.height() as f64).max(1.0);
         let mut cfg = self.imp().cfg.get();
+        let (zoom, _, _, mirror) = cfg.active_transform();
         let dx = (offset_x / (w * 0.5)).clamp(-2.0, 2.0);
         let dy = (offset_y / (h * 0.5)).clamp(-2.0, 2.0);
-        cfg.pan_x = (self.imp().pan_start_x.get() + dx).clamp(-1.0, 1.0);
-        cfg.pan_y = (self.imp().pan_start_y.get() + dy).clamp(-1.0, 1.0);
+        let px = (self.imp().pan_start_x.get() + dx).clamp(-1.0, 1.0);
+        let py = (self.imp().pan_start_y.get() + dy).clamp(-1.0, 1.0);
+        cfg.set_active_transform(zoom, px, py, mirror);
         self.apply_interactive_config(cfg);
     }
 
@@ -470,29 +612,49 @@ impl CompareView {
     }
 }
 
-fn draw_split_handle(snapshot: &gtk4::Snapshot, split_x: f32, h: f32) {
-    // Subtle dark shadow behind line for legibility on bright video.
-    let shadow = graphene::Rect::new(split_x - 2.0, 0.0, 4.0, h);
-    snapshot.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.40), &shadow);
+fn draw_split_handle_oriented(snapshot: &gtk4::Snapshot, w: f32, h: f32, pos: f32, vertical: bool) {
+    let shadow_col = gdk::RGBA::new(0.0, 0.0, 0.0, 0.45);
+    let accent_col = gdk::RGBA::new(0.22, 0.74, 0.97, 0.96);
+    let bg_col = gdk::RGBA::new(0.08, 0.11, 0.16, 0.94);
+    let grip_col = gdk::RGBA::new(0.04, 0.10, 0.16, 0.80);
 
-    let line = graphene::Rect::new(split_x - 1.0, 0.0, 2.0, h);
-    snapshot.append_color(&gdk::RGBA::new(0.22, 0.74, 0.97, 0.95), &line);
+    if vertical {
+        snapshot.append_color(&shadow_col, &graphene::Rect::new(pos - 2.0, 0.0, 4.0, h));
+        snapshot.append_color(&accent_col, &graphene::Rect::new(pos - 1.0, 0.0, 2.0, h));
 
-    let pill_rect = graphene::Rect::new(split_x - 7.0, h * 0.5 - 22.0, 14.0, 44.0);
-    let rounded = gsk::RoundedRect::from_rect(pill_rect, 7.0);
-    snapshot.push_rounded_clip(&rounded);
-    snapshot.append_color(&gdk::RGBA::new(0.08, 0.11, 0.16, 0.92), &pill_rect);
-    let inner = graphene::Rect::new(split_x - 5.0, h * 0.5 - 20.0, 10.0, 40.0);
-    let inner_rounded = gsk::RoundedRect::from_rect(inner, 5.0);
-    snapshot.push_rounded_clip(&inner_rounded);
-    snapshot.append_color(&gdk::RGBA::new(0.22, 0.74, 0.97, 0.94), &inner);
-    // Subtle dark center grip bars.
-    for dy in [-6.0f32, 0.0, 6.0] {
-        let grip = graphene::Rect::new(split_x - 2.5, h * 0.5 + dy - 0.75, 5.0, 1.5);
-        snapshot.append_color(&gdk::RGBA::new(0.04, 0.10, 0.16, 0.75), &grip);
+        let pill_rect = graphene::Rect::new(pos - 8.0, h * 0.5 - 24.0, 16.0, 48.0);
+        snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(pill_rect, 8.0));
+        snapshot.append_color(&bg_col, &pill_rect);
+        let inner = graphene::Rect::new(pos - 6.0, h * 0.5 - 22.0, 12.0, 44.0);
+        snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(inner, 6.0));
+        snapshot.append_color(&accent_col, &inner);
+        for dy in [-6.0f32, 0.0, 6.0] {
+            snapshot.append_color(
+                &grip_col,
+                &graphene::Rect::new(pos - 3.0, h * 0.5 + dy - 0.75, 6.0, 1.5),
+            );
+        }
+        snapshot.pop();
+        snapshot.pop();
+    } else {
+        snapshot.append_color(&shadow_col, &graphene::Rect::new(0.0, pos - 2.0, w, 4.0));
+        snapshot.append_color(&accent_col, &graphene::Rect::new(0.0, pos - 1.0, w, 2.0));
+
+        let pill_rect = graphene::Rect::new(w * 0.5 - 24.0, pos - 8.0, 48.0, 16.0);
+        snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(pill_rect, 8.0));
+        snapshot.append_color(&bg_col, &pill_rect);
+        let inner = graphene::Rect::new(w * 0.5 - 22.0, pos - 6.0, 44.0, 12.0);
+        snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(inner, 6.0));
+        snapshot.append_color(&accent_col, &inner);
+        for dx in [-6.0f32, 0.0, 6.0] {
+            snapshot.append_color(
+                &grip_col,
+                &graphene::Rect::new(w * 0.5 + dx - 0.75, pos - 3.0, 1.5, 6.0),
+            );
+        }
+        snapshot.pop();
+        snapshot.pop();
     }
-    snapshot.pop();
-    snapshot.pop();
 }
 
 fn draw_transformed(
@@ -500,6 +662,7 @@ fn draw_transformed(
     paintable: &gdk::Paintable,
     region: (f32, f32, f32, f32),
     cfg: &CompareConfig,
+    layer: LayerTransform,
 ) {
     let (rx, ry, rw, rh) = region;
     if rw <= 1.0 || rh <= 1.0 {
@@ -510,19 +673,30 @@ fn draw_transformed(
     let (ox, oy, fw, fh) = fit_aspect_rect((rw, rh), aspect);
     let fx = rx + ox;
     let fy = ry + oy;
-    let zoom = (cfg.zoom as f32).clamp(1.0, 3.0);
-    let scale_x = if cfg.mirror { -zoom } else { zoom };
-    let pan_dx = (cfg.pan_x as f32).clamp(-1.0, 1.0) * fw * 0.5;
-    let pan_dy = (cfg.pan_y as f32).clamp(-1.0, 1.0) * fh * 0.5;
+    let view_zoom = (cfg.zoom as f32).clamp(1.0, 3.0);
+    let view_scale_x = if cfg.mirror { -view_zoom } else { view_zoom };
+    let view_pan_dx = (cfg.pan_x as f32).clamp(-1.0, 1.0) * fw * 0.5;
+    let view_pan_dy = (cfg.pan_y as f32).clamp(-1.0, 1.0) * fh * 0.5;
+
+    let layer_zoom = (layer.zoom as f32).clamp(0.5, 3.0);
+    let layer_scale_x = if layer.mirror {
+        -layer_zoom
+    } else {
+        layer_zoom
+    };
+    let layer_pan_dx = (layer.pan_x as f32).clamp(-1.0, 1.0) * fw * 0.5;
+    let layer_pan_dy = (layer.pan_y as f32).clamp(-1.0, 1.0) * fh * 0.5;
 
     let clip = graphene::Rect::new(rx, ry, rw, rh);
     snapshot.save();
     snapshot.push_clip(&clip);
     snapshot.translate(&graphene::Point::new(
-        fx + fw * 0.5 + pan_dx,
-        fy + fh * 0.5 + pan_dy,
+        fx + fw * 0.5 + view_pan_dx,
+        fy + fh * 0.5 + view_pan_dy,
     ));
-    snapshot.scale(scale_x, zoom);
+    snapshot.scale(view_scale_x, view_zoom);
+    snapshot.translate(&graphene::Point::new(layer_pan_dx, layer_pan_dy));
+    snapshot.scale(layer_scale_x, layer_zoom);
     snapshot.translate(&graphene::Point::new(-fw * 0.5, -fh * 0.5));
     paintable.snapshot(snapshot, fw as f64, fh as f64);
     snapshot.pop();
@@ -568,6 +742,28 @@ mod tests {
         let (left, right) = split_clip_rects(1000.0, 500.0, 0.35);
         assert_eq!(left, (0.0, 0.0, 350.0, 500.0));
         assert_eq!(right, (350.0, 0.0, 650.0, 500.0));
+
+        let (top, bottom) = split_clip_rects_oriented(1000.0, 500.0, 0.40, false);
+        assert_eq!(top, (0.0, 0.0, 1000.0, 200.0));
+        assert_eq!(bottom, (0.0, 200.0, 1000.0, 300.0));
+    }
+
+    #[test]
+    fn compare_config_tracks_independent_layer_transforms() {
+        let mut cfg = CompareConfig {
+            target: CompareTarget::Live,
+            ..Default::default()
+        };
+        cfg.set_active_transform(1.4, 0.25, -0.1, true);
+        assert_eq!(cfg.active_transform(), (1.4, 0.25, -0.1, true));
+        assert!(cfg.loop_transform.is_identity());
+        assert_eq!(cfg.zoom, 1.0);
+
+        cfg.target = CompareTarget::Both;
+        assert_eq!(cfg.active_transform(), (1.0, 0.0, 0.0, false));
+
+        cfg.reset_transforms();
+        assert!(cfg.live_transform.is_identity());
     }
 
     #[test]

@@ -137,7 +137,7 @@ impl VideoBranch {
 
         let (out_valve, out_sink) = attach_preview_leg(pipeline, &out_tee, "out", backend)?;
 
-        let matcher = Arc::new(FrameMatcher::new());
+        let matcher = Arc::new(FrameMatcher::with_enabled(cfg.compare.similarity));
         attach_similarity_probe(&loop_valve, FrameSide::Loop, Arc::clone(&matcher));
         attach_similarity_probe(&live_valve, FrameSide::Live, Arc::clone(&matcher));
 
@@ -331,6 +331,7 @@ fn build_loop_branch(
     let queue = make_element("queue", Some("loop_video_queue"))?;
     let convert = make_element("videoconvert", Some("loop_convert"))?;
     let scale = make_element("videoscale", Some("loop_scale"))?;
+    scale.set_property("add-borders", true);
     let rate = make_element("videorate", Some("loop_rate"))?;
     let caps = make_capsfilter("loop_caps", common_caps)?;
     // clocksync paces non-live MP4 uridecodebin frames at 1x real-time even when audio-less.
@@ -508,6 +509,7 @@ fn build_live_branch(
     let queue = make_element("queue", Some("live_video_queue"))?;
     let convert = make_element("videoconvert", Some("live_convert"))?;
     let scale = make_element("videoscale", Some("live_scale"))?;
+    scale.set_property("add-borders", true);
     let rate = make_element("videorate", Some("live_rate"))?;
     let caps = make_capsfilter("live_caps", common_caps)?;
     let tee = make_element("tee", Some("live_tee"))?;

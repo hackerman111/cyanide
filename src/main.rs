@@ -417,7 +417,8 @@ fn ensure_window(ctrl: &Rc<RefCell<AppController>>) {
         });
     });
 
-    let win = MainWindow::new(&app, on_action, on_visibility);
+    let initial_layout = ctrl.borrow().config.ui;
+    let win = MainWindow::new(&app, initial_layout, on_action, on_visibility);
     {
         let mut c = ctrl.borrow_mut();
         c.window = Some(win);
@@ -501,7 +502,9 @@ fn open_overlay(ctrl: &Rc<RefCell<AppController>>) {
         c.bind_pipeline_paintables();
         if let Some(ref ov) = c.overlay {
             ov.sync_state(&c.config, &c.state);
-            if let Some(ref pipe) = c.pipeline {
+            if c.config.compare.similarity
+                && let Some(ref pipe) = c.pipeline
+            {
                 ov.set_similarity(pipe.similarity());
             }
         }
@@ -774,6 +777,12 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             }
             schedule_config_save(ctrl);
         }
+        UiAction::SeekLoopMs(pos_ms) => {
+            let c = ctrl.borrow();
+            if let Some(ref pipe) = c.pipeline {
+                let _ = pipe.seek_loop_ms(pos_ms);
+            }
+        }
         UiAction::ToggleOverlay(visible) => {
             set_overlay_visible(ctrl, visible);
         }
@@ -781,6 +790,12 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             let c = ctrl.borrow();
             if let Some(ref ov) = c.overlay {
                 ov.sync_state(&c.config, &c.state);
+            }
+        }
+        UiAction::ToggleFullscreen(fullscreen) => {
+            let c = ctrl.borrow();
+            if let Some(ref win) = c.window {
+                win.set_fullscreen(fullscreen);
             }
         }
         UiAction::SetHotkeyCapture(capturing) => {
@@ -793,6 +808,8 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
             let mut hotkey_changed = false;
             let mut lag_changed = false;
             let mut ping_pong_changed = false;
+            let mut similarity_changed = false;
+            let mut layout_only = false;
 
             {
                 let mut guard = ctrl.borrow_mut();
@@ -858,11 +875,18 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                         ping_pong_changed = true;
                     }
                     ConfigPatch::Compare(cmp) => {
+                        if c.config.compare.similarity != cmp.similarity {
+                            similarity_changed = true;
+                        }
                         c.config.compare = cmp;
                     }
                     ConfigPatch::Lag(lag) => {
                         c.config.lag = lag;
                         lag_changed = true;
+                    }
+                    ConfigPatch::UiLayout(ui) => {
+                        c.config.ui = ui;
+                        layout_only = true;
                     }
                 }
                 c.config = c.config.clone().sanitized();
@@ -886,7 +910,12 @@ fn handle_ui_action(ctrl: &Rc<RefCell<AppController>>, action: UiAction) {
                 if ping_pong_changed && let Some(ref pipe) = c.pipeline {
                     pipe.set_loop_ping_pong(c.config.loop_ping_pong);
                 }
-                c.sync_window();
+                if similarity_changed && let Some(ref pipe) = c.pipeline {
+                    pipe.set_similarity_enabled(c.config.compare.similarity);
+                }
+                if !layout_only {
+                    c.sync_window();
+                }
             }
 
             schedule_config_save(ctrl);
@@ -925,6 +954,13 @@ fn shutdown_controller(ctrl: &Rc<RefCell<AppController>>) {
             return;
         }
         c.shutting_down = true;
+        if let Some(ref win) = c.window {
+            let layout = win.snapshot_layout();
+            if c.config.ui != layout {
+                c.config.ui = layout;
+                let _ = c.config.save(&c.config_path);
+            }
+        }
         if let Some(id) = c.save_timer.take() {
             id.remove();
             let _ = c.config.save(&c.config_path);
@@ -1109,7 +1145,12 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
                     .pipeline
                     .as_ref()
                     .is_some_and(MediaPipeline::is_loop_reversed);
-                let similarity = c.pipeline.as_ref().map(MediaPipeline::similarity);
+                let similarity = c
+                    .config
+                    .compare
+                    .similarity
+                    .then(|| c.pipeline.as_ref().map(MediaPipeline::similarity))
+                    .flatten();
                 if c.state.recording
                     && let Some(elapsed) = c
                         .pipeline
@@ -1132,6 +1173,7 @@ fn run_daemon(background: bool, test_sources: bool) -> ExitCode {
                 }
             }
             if overlay_visible
+                && c.config.compare.similarity
                 && let Some(ref ov) = c.overlay
                 && let Some(ref pipe) = c.pipeline
             {

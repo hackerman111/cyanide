@@ -47,21 +47,71 @@ pub enum CompareMode {
     Split,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareTarget {
+    #[default]
+    Both,
+    Loop,
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayerTransform {
+    pub zoom: f64,
+    pub pan_x: f64,
+    pub pan_y: f64,
+    pub mirror: bool,
+}
+
+impl Default for LayerTransform {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            mirror: false,
+        }
+    }
+}
+
+impl LayerTransform {
+    pub fn sanitized(mut self) -> Self {
+        self.zoom = clamp_finite(self.zoom, 0.5, 3.0, 1.0);
+        self.pan_x = clamp_finite(self.pan_x, -1.0, 1.0, 0.0);
+        self.pan_y = clamp_finite(self.pan_y, -1.0, 1.0, 0.0);
+        self
+    }
+
+    pub fn is_identity(&self) -> bool {
+        (self.zoom - 1.0).abs() <= 0.001
+            && self.pan_x.abs() <= 0.001
+            && self.pan_y.abs() <= 0.001
+            && !self.mirror
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompareConfig {
     pub mode: CompareMode,
     pub opacity: f64,
     pub split_pos: f64,
+    pub split_vertical: bool,
     pub show_grid: bool,
     pub show_center: bool,
     pub show_guides: bool,
+    pub similarity: bool,
     pub guide_x: f64,
     pub guide_y: f64,
+    pub target: CompareTarget,
     pub mirror: bool,
     pub zoom: f64,
     pub pan_x: f64,
     pub pan_y: f64,
+    pub loop_transform: LayerTransform,
+    pub live_transform: LayerTransform,
 }
 
 impl Default for CompareConfig {
@@ -70,16 +120,108 @@ impl Default for CompareConfig {
             mode: CompareMode::Overlay,
             opacity: 0.5,
             split_pos: 0.5,
+            split_vertical: true,
             show_grid: false,
             show_center: false,
             show_guides: false,
+            similarity: false,
             guide_x: 0.5,
             guide_y: 0.5,
+            target: CompareTarget::Both,
             mirror: false,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
+            loop_transform: LayerTransform::default(),
+            live_transform: LayerTransform::default(),
         }
+    }
+}
+
+impl CompareConfig {
+    pub fn active_transform(&self) -> (f64, f64, f64, bool) {
+        match self.target {
+            CompareTarget::Both => (self.zoom, self.pan_x, self.pan_y, self.mirror),
+            CompareTarget::Loop => (
+                self.loop_transform.zoom,
+                self.loop_transform.pan_x,
+                self.loop_transform.pan_y,
+                self.loop_transform.mirror,
+            ),
+            CompareTarget::Live => (
+                self.live_transform.zoom,
+                self.live_transform.pan_x,
+                self.live_transform.pan_y,
+                self.live_transform.mirror,
+            ),
+        }
+    }
+
+    pub fn set_active_transform(&mut self, zoom: f64, pan_x: f64, pan_y: f64, mirror: bool) {
+        match self.target {
+            CompareTarget::Both => {
+                self.zoom = zoom.clamp(1.0, 3.0);
+                self.pan_x = pan_x.clamp(-1.0, 1.0);
+                self.pan_y = pan_y.clamp(-1.0, 1.0);
+                self.mirror = mirror;
+            }
+            CompareTarget::Loop => {
+                self.loop_transform = LayerTransform {
+                    zoom,
+                    pan_x,
+                    pan_y,
+                    mirror,
+                }
+                .sanitized();
+            }
+            CompareTarget::Live => {
+                self.live_transform = LayerTransform {
+                    zoom,
+                    pan_x,
+                    pan_y,
+                    mirror,
+                }
+                .sanitized();
+            }
+        }
+    }
+
+    pub fn reset_transforms(&mut self) {
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+        self.mirror = false;
+        self.loop_transform = LayerTransform::default();
+        self.live_transform = LayerTransform::default();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiLayoutConfig {
+    pub window_width: i32,
+    pub window_height: i32,
+    pub split_position: i32,
+    pub sidebar_visible: bool,
+}
+
+impl Default for UiLayoutConfig {
+    fn default() -> Self {
+        Self {
+            window_width: 1366,
+            window_height: 768,
+            split_position: 860,
+            sidebar_visible: true,
+        }
+    }
+}
+
+impl UiLayoutConfig {
+    pub fn sanitized(mut self) -> Self {
+        self.window_width = self.window_width.clamp(960, 3840);
+        self.window_height = self.window_height.clamp(620, 2160);
+        self.split_position = self.split_position.clamp(380, 3200);
+        self
     }
 }
 
@@ -143,6 +285,7 @@ pub struct Config {
     pub loop_ping_pong: bool,
     pub compare: CompareConfig,
     pub lag: LagConfig,
+    pub ui: UiLayoutConfig,
 }
 
 impl Default for Config {
@@ -163,6 +306,7 @@ impl Default for Config {
             loop_ping_pong: false,
             compare: CompareConfig::default(),
             lag: LagConfig::default(),
+            ui: UiLayoutConfig::default(),
         }
     }
 }
@@ -194,6 +338,9 @@ impl Config {
         self.compare.zoom = clamp_finite(self.compare.zoom, 1.0, 3.0, 1.0);
         self.compare.pan_x = clamp_finite(self.compare.pan_x, -1.0, 1.0, 0.0);
         self.compare.pan_y = clamp_finite(self.compare.pan_y, -1.0, 1.0, 0.0);
+        self.compare.loop_transform = self.compare.loop_transform.sanitized();
+        self.compare.live_transform = self.compare.live_transform.sanitized();
+        self.ui = self.ui.sanitized();
 
         if self.real_mic.as_deref().is_some_and(is_forbidden_mic) {
             self.real_mic = None;
@@ -262,6 +409,7 @@ mod tests {
         assert_eq!(cfg.av_delay_ms, 0);
         assert_eq!(cfg.real_mic, None);
         assert!(!cfg.loop_ping_pong);
+        assert!(!cfg.compare.similarity);
         assert!(!cfg.lag.enabled);
         assert!(!cfg.lag.freeze_on_switch);
         assert_eq!(cfg.lag.min_duration_ms, 100);
@@ -285,7 +433,19 @@ mod tests {
             compare: CompareConfig {
                 opacity: 3.0,
                 zoom: 0.2,
+                live_transform: LayerTransform {
+                    zoom: 0.1,
+                    pan_x: 5.0,
+                    pan_y: -3.0,
+                    mirror: true,
+                },
                 ..Default::default()
+            },
+            ui: UiLayoutConfig {
+                window_width: 100,
+                window_height: 9999,
+                split_position: 50,
+                sidebar_visible: false,
             },
             real_mic: Some("VirtualCamMic".into()),
             hotkey: Some("shift+super+f8".into()),
@@ -305,6 +465,13 @@ mod tests {
         assert_eq!(clean.live_volume, 1.5);
         assert_eq!(clean.compare.opacity, 1.0);
         assert_eq!(clean.compare.zoom, 1.0);
+        assert_eq!(clean.compare.live_transform.zoom, 0.5);
+        assert_eq!(clean.compare.live_transform.pan_x, 1.0);
+        assert_eq!(clean.compare.live_transform.pan_y, -1.0);
+        assert_eq!(clean.ui.window_width, 960);
+        assert_eq!(clean.ui.window_height, 2160);
+        assert_eq!(clean.ui.split_position, 380);
+        assert!(!clean.ui.sidebar_visible);
         assert_eq!(clean.video.fps, 30);
         assert_eq!(clean.real_mic, None);
         assert_eq!(clean.hotkey.as_deref(), Some("SUPER+SHIFT+F8"));
@@ -319,5 +486,22 @@ mod tests {
         std::fs::write(&path, "not valid = [toml").unwrap();
         assert!(matches!(Config::load(&path), Err(ConfigError::Parse(_))));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_parses_legacy_toml_without_ui_or_layer_fields() {
+        let legacy = r#"
+startup_mode = "loop"
+[compare]
+mode = "split"
+opacity = 0.7
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        let clean = cfg.sanitized();
+        assert_eq!(clean.startup_mode, StartupMode::Loop);
+        assert_eq!(clean.compare.mode, CompareMode::Split);
+        assert!(clean.compare.split_vertical);
+        assert_eq!(clean.compare.target, CompareTarget::Both);
+        assert_eq!(clean.ui, UiLayoutConfig::default());
     }
 }

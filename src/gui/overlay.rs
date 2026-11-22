@@ -102,7 +102,7 @@ impl OverlayWindow {
 
         let compare_view = CompareView::new();
         compare_view.set_interactive(false);
-        compare_view.set_match_highlight(true);
+        compare_view.set_match_highlight(false);
         compare_view.set_size_request(260, 150);
 
         // Top HUD badges (non-blocking for window drag)
@@ -110,6 +110,7 @@ impl OverlayWindow {
         match_label.add_css_class("numeric");
         match_label.add_css_class("cyanide-match-pill");
         match_label.set_tooltip_text(Some("Схожесть live-камеры с видео"));
+        match_label.set_visible(false);
 
         let frozen_badge = gtk4::Label::new(Some("СТОП-КАДР"));
         frozen_badge.add_css_class("cyanide-hud-chip");
@@ -258,6 +259,12 @@ impl OverlayWindow {
         cmp.mode = CompareMode::Overlay;
         cmp.show_grid = self.grid_enabled.get();
         self.compare_view.set_config(cmp);
+        self.compare_view
+            .set_match_highlight(cfg.compare.similarity);
+        self.match_label.set_visible(cfg.compare.similarity);
+        if !cfg.compare.similarity {
+            self.set_similarity(0.0);
+        }
         if self.compare_view.is_frozen() != state.frozen_reference {
             self.compare_view.set_frozen(state.frozen_reference);
         }

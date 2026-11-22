@@ -229,6 +229,10 @@ impl MediaPipeline {
         self.video.matcher.score()
     }
 
+    pub fn set_similarity_enabled(&self, enabled: bool) {
+        self.video.matcher.set_enabled(enabled);
+    }
+
     pub fn set_reference_frozen(&self, frozen: bool) {
         self.video.matcher.set_frozen(frozen);
     }
@@ -263,6 +267,10 @@ impl MediaPipeline {
 
     pub fn loop_position_ms(&self) -> Option<(u64, Option<u64>)> {
         self.video.loop_position_ms()
+    }
+
+    pub fn seek_loop_ms(&self, position_ms: u64) -> bool {
+        self.video.seek_loop(&self.pipeline, position_ms, true)
     }
 
     pub fn preview_objects(&self) -> &PreviewObjects {

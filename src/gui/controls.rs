@@ -12,7 +12,7 @@ use crate::devices::DeviceInventory;
 use crate::gui::{ConfigPatch, UiAction};
 use crate::hotkey::Hotkey;
 use crate::state::{
-    AppState, AudioLevels, AudioSource, Command, MicAction, RecordAction, StreamMode, VideoSource,
+    AppState, AudioLevels, AudioSource, Command, MicAction, StreamMode, VideoSource,
 };
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
@@ -46,20 +46,18 @@ pub struct ControlPanel {
     syncing: Rc<Cell<bool>>,
     out_picture: gtk4::Picture,
     monitor_screen: gtk4::Box,
-    monitor_badge: gtk4::Label,
-    preset_loop_btn: gtk4::Button,
-    preset_live_btn: gtk4::Button,
+    device_badge: gtk4::Label,
+    source_badge: gtk4::Label,
+    rec_badge: gtk4::Label,
+    monitor_status_label: gtk4::Label,
+    source_loop_btn: gtk4::ToggleButton,
+    source_live_btn: gtk4::ToggleButton,
     quick_mic_btn: gtk4::ToggleButton,
-    video_loop_btn: gtk4::ToggleButton,
-    video_live_btn: gtk4::ToggleButton,
     audio_combo: adw::ComboRow,
-    mic_switch: adw::SwitchRow,
     startup_combo: adw::ComboRow,
     hotkey_row: adw::ActionRow,
     hotkey_entry: gtk4::Entry,
     loop_file_row: adw::ActionRow,
-    record_row: adw::ActionRow,
-    record_btn: gtk4::Button,
     real_cam_combo: adw::ComboRow,
     virt_cam_combo: adw::ComboRow,
     real_mic_combo: adw::ComboRow,
@@ -107,39 +105,49 @@ impl ControlPanel {
     ) -> Self {
         let widget = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
-            .spacing(10)
-            .margin_top(10)
-            .margin_bottom(10)
-            .margin_start(10)
+            .spacing(8)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_start(8)
             .margin_end(12)
-            .width_request(396)
             .vexpand(true)
             .build();
+        widget.set_size_request(360, -1);
 
-        // === Fixed Top: Virtual Camera Program Monitor ("В эфире") ===
+        // === Fixed Top: Virtual Camera Program Monitor ===
         let monitor_card = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
             .spacing(8)
             .build();
-        monitor_card.add_css_class("card");
         monitor_card.add_css_class("cyanide-monitor-card");
 
         let mon_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        let mon_title = gtk4::Label::new(Some("ВЫХОД ВИРТУАЛЬНОЙ КАМЕРЫ"));
+        let mon_title = gtk4::Label::new(Some("Выход камеры"));
         mon_title.set_xalign(0.0);
         mon_title.set_hexpand(true);
-        mon_title.add_css_class("caption-heading");
-        mon_title.add_css_class("dim-label");
+        mon_title.add_css_class("cyanide-section-title");
 
-        let monitor_badge = gtk4::Label::new(Some("● LIVE"));
-        monitor_badge.add_css_class("cyanide-status-pill");
-        monitor_badge.add_css_class("live");
+        let device_badge = gtk4::Label::new(Some("VirtualCam"));
+        device_badge.add_css_class("cyanide-status-pill");
+        device_badge.add_css_class("live");
+
+        let source_badge = gtk4::Label::new(Some("Камера"));
+        source_badge.add_css_class("cyanide-status-pill");
+        source_badge.add_css_class("live");
+
+        let rec_badge = gtk4::Label::new(Some("● ЗАПИСЬ"));
+        rec_badge.add_css_class("cyanide-status-pill");
+        rec_badge.add_css_class("recording");
+        rec_badge.set_visible(false);
+
         mon_header.append(&mon_title);
-        mon_header.append(&monitor_badge);
+        mon_header.append(&device_badge);
+        mon_header.append(&source_badge);
+        mon_header.append(&rec_badge);
         monitor_card.append(&mon_header);
 
         let out_picture = gtk4::Picture::builder()
-            .height_request(158)
+            .height_request(152)
             .can_shrink(true)
             .content_fit(gtk4::ContentFit::Contain)
             .hexpand(true)
@@ -151,30 +159,61 @@ impl ControlPanel {
         monitor_screen.append(&out_picture);
         monitor_card.append(&monitor_screen);
 
-        let quick_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let preset_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        preset_box.add_css_class("linked");
-        preset_box.set_hexpand(true);
-        preset_box.set_homogeneous(true);
+        let monitor_status_label = gtk4::Label::new(Some("Видео: Камера · Звук: Микрофон"));
+        monitor_status_label.set_xalign(0.0);
+        monitor_status_label.set_wrap(true);
+        monitor_status_label.add_css_class("cyanide-caption");
+        monitor_card.append(&monitor_status_label);
 
-        let preset_loop_btn = gtk4::Button::with_label("Режим Loop");
-        let preset_live_btn = gtk4::Button::with_label("Режим Live");
+        let quick_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let source_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        source_box.add_css_class("linked");
+        source_box.set_hexpand(true);
+        source_box.set_homogeneous(true);
+
+        let source_loop_btn = gtk4::ToggleButton::with_label("Видео (MP4)");
+        source_loop_btn.add_css_class("cyanide-source-btn");
+        source_loop_btn.add_css_class("loop");
+        source_loop_btn.set_tooltip_text(Some("Подать в виртуальную камеру видеофайл и его звук"));
+
+        let source_live_btn = gtk4::ToggleButton::with_label("Камера");
+        source_live_btn.add_css_class("cyanide-source-btn");
+        source_live_btn.add_css_class("live");
+        source_live_btn.set_tooltip_text(Some(
+            "Подать в виртуальную камеру реальную камеру и микрофон",
+        ));
+        source_live_btn.set_group(Some(&source_loop_btn));
+        source_live_btn.set_active(true);
+
         {
             let act = Rc::clone(&on_action);
-            preset_loop_btn.connect_clicked(move |_| {
-                act(UiAction::Command(Command::SetMode(StreamMode::Loop)))
+            let s = Rc::clone(&syncing);
+            source_loop_btn.connect_toggled(move |b| {
+                if !s.get() && b.is_active() {
+                    act(UiAction::Command(Command::SetMode(StreamMode::Loop)));
+                }
             });
             let act = Rc::clone(&on_action);
-            preset_live_btn.connect_clicked(move |_| {
-                act(UiAction::Command(Command::SetMode(StreamMode::Live)))
+            let s = Rc::clone(&syncing);
+            source_live_btn.connect_toggled(move |b| {
+                if !s.get() && b.is_active() {
+                    act(UiAction::Command(Command::SetMode(StreamMode::Live)));
+                }
             });
         }
-        preset_box.append(&preset_loop_btn);
-        preset_box.append(&preset_live_btn);
+        source_box.append(&source_loop_btn);
+        source_box.append(&source_live_btn);
 
         let quick_mic_btn = gtk4::ToggleButton::new();
-        quick_mic_btn.set_icon_name("audio-input-microphone-symbolic");
-        quick_mic_btn.set_tooltip_text(Some("Включить/выключить виртуальный микрофон"));
+        let mic_btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        mic_btn_box.append(&gtk4::Image::from_icon_name(
+            "audio-input-microphone-symbolic",
+        ));
+        mic_btn_box.append(&gtk4::Label::new(Some("Микр.")));
+        quick_mic_btn.set_child(Some(&mic_btn_box));
+        quick_mic_btn.set_tooltip_text(Some(
+            "Включить/выключить виртуальный микрофон (плавный mute)",
+        ));
         quick_mic_btn.set_active(true);
         {
             let act = Rc::clone(&on_action);
@@ -191,15 +230,15 @@ impl ControlPanel {
                 act(UiAction::Command(Command::SetMic(action)));
             });
         }
-        quick_row.append(&preset_box);
+        quick_row.append(&source_box);
         quick_row.append(&quick_mic_btn);
         monitor_card.append(&quick_row);
         widget.append(&monitor_card);
 
-        // === Compact 4-Tab Studio Switcher ===
+        // === 4-Tab Studio Switcher ===
         let stack = gtk4::Stack::builder()
             .transition_type(gtk4::StackTransitionType::Crossfade)
-            .transition_duration(140)
+            .transition_duration(120)
             .vexpand(true)
             .build();
 
@@ -232,90 +271,8 @@ impl ControlPanel {
         }
         widget.append(&tab_strip);
 
-        // === Page 1: Эфир (Stream Routing, MP4 & Recording, Hotkey) ===
+        // === Page 1: Эфир (Loop File, Hotkey, Startup Mode) ===
         let stream_box = make_tab_page_box();
-
-        let routing_group = adw::PreferencesGroup::builder()
-            .title("Маршрутизация")
-            .build();
-
-        let video_loop_btn = gtk4::ToggleButton::with_label("MP4");
-        let video_live_btn = gtk4::ToggleButton::with_label("Камера");
-        video_live_btn.set_group(Some(&video_loop_btn));
-        {
-            let act = Rc::clone(&on_action);
-            let s = Rc::clone(&syncing);
-            video_loop_btn.connect_toggled(move |b| {
-                if !s.get() && b.is_active() {
-                    act(UiAction::Command(Command::SetVideo(VideoSource::Loop)));
-                }
-            });
-            let act = Rc::clone(&on_action);
-            let s = Rc::clone(&syncing);
-            video_live_btn.connect_toggled(move |b| {
-                if !s.get() && b.is_active() {
-                    act(UiAction::Command(Command::SetVideo(VideoSource::Live)));
-                }
-            });
-        }
-        let video_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        video_box.add_css_class("linked");
-        video_box.set_valign(gtk4::Align::Center);
-        video_box.append(&video_loop_btn);
-        video_box.append(&video_live_btn);
-        let video_row = adw::ActionRow::builder().title("Видеопоток").build();
-        video_row.add_suffix(&video_box);
-        routing_group.add(&video_row);
-
-        let audio_combo = adw::ComboRow::builder()
-            .title("Источник аудио")
-            .model(&gtk4::StringList::new(&[
-                "Файл MP4",
-                "Настоящий микрофон",
-                "Смесь (MP4 + микрофон)",
-                "Тишина",
-            ]))
-            .build();
-        {
-            let act = Rc::clone(&on_action);
-            let s = Rc::clone(&syncing);
-            audio_combo.connect_selected_notify(move |c| {
-                if s.get() {
-                    return;
-                }
-                let src = match c.selected() {
-                    0 => AudioSource::File,
-                    1 => AudioSource::Mic,
-                    2 => AudioSource::Mix,
-                    _ => AudioSource::Silence,
-                };
-                act(UiAction::Command(Command::SetAudio(src)));
-            });
-        }
-        routing_group.add(&audio_combo);
-
-        let mic_switch = adw::SwitchRow::builder()
-            .title("Виртуальный микрофон")
-            .subtitle("Плавный mute без отключения VirtualCamMic")
-            .active(true)
-            .build();
-        {
-            let act = Rc::clone(&on_action);
-            let s = Rc::clone(&syncing);
-            mic_switch.connect_active_notify(move |sw| {
-                if s.get() {
-                    return;
-                }
-                let action = if sw.is_active() {
-                    MicAction::On
-                } else {
-                    MicAction::Off
-                };
-                act(UiAction::Command(Command::SetMic(action)));
-            });
-        }
-        routing_group.add(&mic_switch);
-        stream_box.append(&routing_group);
 
         let media_group = adw::PreferencesGroup::builder()
             .title("Видео для петли")
@@ -354,32 +311,17 @@ impl ControlPanel {
         }
         loop_file_row.add_suffix(&pick_btn);
         media_group.add(&loop_file_row);
-
-        let record_row = adw::ActionRow::builder()
-            .title("Запись с камеры")
-            .subtitle("Записать MP4 на лету и сразу загрузить в петлю")
-            .build();
-        let record_btn = gtk4::Button::with_label("● Записать");
-        record_btn.set_valign(gtk4::Align::Center);
-        {
-            let act = Rc::clone(&on_action);
-            record_btn.connect_clicked(move |_| {
-                act(UiAction::Command(Command::Record(RecordAction::Toggle)))
-            });
-        }
-        record_row.add_suffix(&record_btn);
-        media_group.add(&record_row);
         stream_box.append(&media_group);
 
         let control_group = adw::PreferencesGroup::builder().title("Управление").build();
 
         let hotkey_row = adw::ActionRow::builder()
             .title("Системный хоткей")
-            .subtitle("Переключение Loop ↔ Live")
+            .subtitle("Переключение Видео ↔ Камера")
             .build();
         let hotkey_entry = gtk4::Entry::builder()
             .placeholder_text("SUPER+F8")
-            .width_chars(10)
+            .width_chars(8)
             .valign(gtk4::Align::Center)
             .build();
         let hk_record_btn = gtk4::ToggleButton::with_label("Задать");
@@ -645,8 +587,39 @@ impl ControlPanel {
 
         stack.add_named(&wrap_scroll(&devices_box), Some("devices"));
 
-        // === Page 3: Аудио (Compact VU Meters + Gains + A/V Sync) ===
+        // === Page 3: Аудио (Audio Source + Compact VU Meters + Gains + A/V Sync) ===
         let audio_box = make_tab_page_box();
+
+        let audio_route_group = adw::PreferencesGroup::builder()
+            .title("Маршрутизация звука")
+            .build();
+        let audio_combo = adw::ComboRow::builder()
+            .title("Источник в VirtualCamMic")
+            .model(&gtk4::StringList::new(&[
+                "Файл MP4",
+                "Настоящий микрофон",
+                "Смесь (MP4 + микрофон)",
+                "Тишина",
+            ]))
+            .build();
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            audio_combo.connect_selected_notify(move |c| {
+                if s.get() {
+                    return;
+                }
+                let src = match c.selected() {
+                    0 => AudioSource::File,
+                    1 => AudioSource::Mic,
+                    2 => AudioSource::Mix,
+                    _ => AudioSource::Silence,
+                };
+                act(UiAction::Command(Command::SetAudio(src)));
+            });
+        }
+        audio_route_group.add(&audio_combo);
+        audio_box.append(&audio_route_group);
 
         let vu_group = adw::PreferencesGroup::builder()
             .title("Уровни сигнала (VU)")
@@ -924,20 +897,18 @@ impl ControlPanel {
             syncing,
             out_picture,
             monitor_screen,
-            monitor_badge,
-            preset_loop_btn,
-            preset_live_btn,
+            device_badge,
+            source_badge,
+            rec_badge,
+            monitor_status_label,
+            source_loop_btn,
+            source_live_btn,
             quick_mic_btn,
-            video_loop_btn,
-            video_live_btn,
             audio_combo,
-            mic_switch,
             startup_combo,
             hotkey_row,
             hotkey_entry,
             loop_file_row,
-            record_row,
-            record_btn,
             real_cam_combo,
             virt_cam_combo,
             real_mic_combo,
@@ -991,57 +962,83 @@ impl ControlPanel {
     ) {
         let prev = self.syncing.replace(true);
 
-        // Program monitor status styling
+        // Program monitor status styling: separate Device, Active Source, and Recording state.
+        for cls in ["live", "loop", "warn"] {
+            self.device_badge.remove_css_class(cls);
+        }
+        if state.health.output_warning.is_some() || cfg.virtual_camera.is_none() {
+            self.device_badge.set_label("Заглушка");
+            self.device_badge.add_css_class("warn");
+            self.device_badge.set_tooltip_text(
+                state
+                    .health
+                    .output_warning
+                    .as_deref()
+                    .or(Some("Устройство v4l2loopback не выбрано")),
+            );
+        } else {
+            self.device_badge.set_label("VirtualCam");
+            self.device_badge.add_css_class("live");
+            self.device_badge.set_tooltip_text(
+                cfg.virtual_camera
+                    .as_deref()
+                    .or(Some("Виртуальная камера активна")),
+            );
+        }
+
         for cls in ["live", "loop", "custom", "recording"] {
-            self.monitor_badge.remove_css_class(cls);
+            self.source_badge.remove_css_class(cls);
             self.monitor_screen.remove_css_class(cls);
         }
-        let (badge_text, badge_cls) = if state.recording {
-            ("● ЗАПИСЬ", "recording")
+        let (src_label, src_cls) = match state.mode.video() {
+            VideoSource::Live => ("Камера", "live"),
+            VideoSource::Loop => ("Видео", "loop"),
+        };
+        self.source_badge.set_label(src_label);
+        self.source_badge.add_css_class(src_cls);
+        self.monitor_screen.add_css_class(if state.recording {
+            "recording"
         } else {
-            match state.mode {
-                StreamMode::Live => ("● LIVE", "live"),
-                StreamMode::Loop => ("● LOOP", "loop"),
-                StreamMode::Custom { video, .. } => match video {
-                    VideoSource::Live => ("● CUSTOM · LIVE", "custom"),
-                    VideoSource::Loop => ("● CUSTOM · LOOP", "custom"),
-                },
+            src_cls
+        });
+        self.rec_badge.set_visible(state.recording);
+
+        match state.mode.video() {
+            VideoSource::Loop => self.source_loop_btn.set_active(true),
+            VideoSource::Live => self.source_live_btn.set_active(true),
+        }
+
+        let audio_desc = if !state.virtual_mic_enabled {
+            "выключен (Mute)"
+        } else {
+            match state.mode.audio() {
+                AudioSource::File => "файл MP4",
+                AudioSource::Mic => "микрофон",
+                AudioSource::Mix => "смесь",
+                AudioSource::Silence => "тишина",
             }
         };
-        self.monitor_badge.set_label(badge_text);
-        self.monitor_badge.add_css_class(badge_cls);
-        self.monitor_screen.add_css_class(badge_cls);
-
-        match state.mode {
-            StreamMode::Loop => {
-                self.preset_loop_btn.add_css_class("suggested-action");
-                self.preset_live_btn.remove_css_class("suggested-action");
-            }
-            StreamMode::Live => {
-                self.preset_live_btn.add_css_class("suggested-action");
-                self.preset_loop_btn.remove_css_class("suggested-action");
-            }
-            StreamMode::Custom { .. } => {
-                self.preset_loop_btn.remove_css_class("suggested-action");
-                self.preset_live_btn.remove_css_class("suggested-action");
-            }
-        }
+        let mic_desc = if state.virtual_mic_enabled {
+            "вкл."
+        } else {
+            "выкл."
+        };
+        let play_desc = if state.mode.video() == VideoSource::Loop {
+            " · петля активна"
+        } else {
+            ""
+        };
+        self.monitor_status_label.set_label(&format!(
+            "Видео: {src_label} · Звук: {audio_desc} · Микр.: {mic_desc}{play_desc}"
+        ));
 
         self.quick_mic_btn.set_active(state.virtual_mic_enabled);
         if state.virtual_mic_enabled {
-            self.quick_mic_btn
-                .set_icon_name("audio-input-microphone-symbolic");
             self.quick_mic_btn.remove_css_class("destructive-action");
         } else {
-            self.quick_mic_btn
-                .set_icon_name("microphone-sensitivity-muted-symbolic");
             self.quick_mic_btn.add_css_class("destructive-action");
         }
 
-        match state.mode.video() {
-            VideoSource::Loop => self.video_loop_btn.set_active(true),
-            VideoSource::Live => self.video_live_btn.set_active(true),
-        }
         let audio_idx = match state.mode.audio() {
             AudioSource::File => 0,
             AudioSource::Mic => 1,
@@ -1049,7 +1046,6 @@ impl ControlPanel {
             AudioSource::Silence => 3,
         };
         self.audio_combo.set_selected(audio_idx);
-        self.mic_switch.set_active(state.virtual_mic_enabled);
         self.startup_combo.set_selected(match cfg.startup_mode {
             StartupMode::Live => 0,
             StartupMode::Loop => 1,
@@ -1061,7 +1057,7 @@ impl ControlPanel {
         }
         let hk_subtitle = match hotkey_error {
             Some(err) => err,
-            None if cfg.hotkey.is_some() => "Активен для Loop ↔ Live",
+            None if cfg.hotkey.is_some() => "Активен для переключения Видео ↔ Камера",
             None => "Нажмите «Задать» или введите, напр. SUPER+F8",
         };
         self.hotkey_row.set_subtitle(hk_subtitle);
@@ -1073,6 +1069,12 @@ impl ControlPanel {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Не выбран".into());
         self.loop_file_row.set_subtitle(&file_label);
+        self.loop_file_row.set_tooltip_text(
+            cfg.loop_file
+                .as_deref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+        );
 
         sync_combo(
             &self.real_cam_combo,
@@ -1172,29 +1174,8 @@ impl ControlPanel {
         self.out_db_label.set_label(&format_db(levels.out_db));
     }
 
-    pub fn update_recording_ui(&self, recording: bool, saving: bool, elapsed_ms: u64) {
-        if saving {
-            self.record_row.set_subtitle("Сохранение MP4…");
-            self.record_btn.set_label("Сохранение…");
-            self.record_btn.set_sensitive(false);
-            self.record_btn.remove_css_class("destructive-action");
-        } else if recording {
-            let secs = elapsed_ms / 1000;
-            self.record_row.set_subtitle(&format!(
-                "Идёт запись · {:02}:{:02}",
-                secs / 60,
-                secs % 60
-            ));
-            self.record_btn.set_label("■ Стоп");
-            self.record_btn.set_sensitive(true);
-            self.record_btn.add_css_class("destructive-action");
-        } else {
-            self.record_row
-                .set_subtitle("Записать MP4 на лету и сразу загрузить в петлю");
-            self.record_btn.set_label("● Записать");
-            self.record_btn.set_sensitive(true);
-            self.record_btn.remove_css_class("destructive-action");
-        }
+    pub fn update_recording_ui(&self, recording: bool, _saving: bool, _elapsed_ms: u64) {
+        self.rec_badge.set_visible(recording);
     }
 }
 
@@ -1210,9 +1191,9 @@ fn make_tab_button(label: &str, group: Option<&gtk4::ToggleButton>) -> gtk4::Tog
 fn make_tab_page_box() -> gtk4::Box {
     gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(2)
-        .margin_bottom(6)
+        .spacing(8)
+        .margin_top(4)
+        .margin_bottom(4)
         .margin_start(1)
         .margin_end(1)
         .build()
@@ -1232,11 +1213,10 @@ fn make_vu_channel(title: &str) -> (gtk4::Box, gtk4::LevelBar, gtk4::Label) {
     let title_lbl = gtk4::Label::new(Some(title));
     title_lbl.set_xalign(0.0);
     title_lbl.set_hexpand(true);
-    title_lbl.add_css_class("caption");
+    title_lbl.add_css_class("cyanide-caption");
     let db_lbl = gtk4::Label::new(Some("-∞"));
-    db_lbl.add_css_class("caption");
+    db_lbl.add_css_class("cyanide-value-readout");
     db_lbl.add_css_class("numeric");
-    db_lbl.add_css_class("dim-label");
     db_lbl.set_width_chars(6);
     db_lbl.set_xalign(1.0);
     top.append(&title_lbl);
@@ -1320,9 +1300,8 @@ fn make_labeled_slider_row(
     let label = gtk4::Label::new(Some(initial_text));
     label.set_width_chars(7);
     label.set_xalign(1.0);
-    label.add_css_class("caption");
+    label.add_css_class("cyanide-value-readout");
     label.add_css_class("numeric");
-    label.add_css_class("dim-label");
     let row = adw::ActionRow::builder().title(title).build();
     row.add_suffix(&label);
     row.add_suffix(&scale);

@@ -9,11 +9,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gtk4::gdk;
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::config::{CompareConfig, Config, LagConfig, LoopReturnPolicy, StartupMode, VideoFormat};
+use crate::config::{
+    CompareConfig, CompareMode, Config, LagConfig, LoopReturnPolicy, StartupMode, UiLayoutConfig,
+    VideoFormat,
+};
 use crate::devices::DeviceInventory;
 use crate::gui::controls::ControlPanel;
 use crate::gui::style::install_app_style;
@@ -38,6 +42,7 @@ pub enum ConfigPatch {
     LoopPingPong(bool),
     Compare(CompareConfig),
     Lag(LagConfig),
+    UiLayout(UiLayoutConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -47,41 +52,61 @@ pub enum UiAction {
     PickLoopFile(PathBuf),
     RefreshDevices,
     SetReturnBookmarkCurrent,
+    SeekLoopMs(u64),
     ToggleOverlay(bool),
     RefreshOverlay,
+    ToggleFullscreen(bool),
     SetHotkeyCapture(bool),
 }
 
 pub struct MainWindow {
     window: adw::ApplicationWindow,
-    status_pill: gtk4::Label,
+    toolbar_view: adw::ToolbarView,
+    paned: gtk4::Paned,
+    header: adw::HeaderBar,
+    footer_box: gtk4::Box,
+    device_pill: gtk4::Label,
+    source_pill: gtk4::Label,
     toggle_btn: gtk4::Button,
     record_btn: gtk4::Button,
     overlay_btn: gtk4::ToggleButton,
+    fullscreen_btn: gtk4::ToggleButton,
+    sidebar_btn: gtk4::ToggleButton,
     banner: adw::Banner,
     workspace: VideoWorkspace,
     controls: ControlPanel,
     footer_label: gtk4::Label,
-    format_label: gtk4::Label,
+    diag_btn: gtk4::MenuButton,
+    diag_label: gtk4::Label,
     lag_chip: gtk4::Label,
     hotkey_chip: gtk4::Label,
+    layout: Rc<Cell<UiLayoutConfig>>,
+    compare_cfg: Rc<Cell<CompareConfig>>,
+    frozen_state: Rc<Cell<bool>>,
+    fullscreen_active: Rc<Cell<bool>>,
     syncing: Rc<Cell<bool>>,
 }
 
 impl MainWindow {
     pub fn new(
         app: &adw::Application,
+        initial_layout: UiLayoutConfig,
         on_action: Rc<dyn Fn(UiAction)>,
         on_visibility: Rc<dyn Fn(bool)>,
     ) -> Self {
         install_app_style();
         let syncing = Rc::new(Cell::new(false));
+        let layout_cell = Rc::new(Cell::new(initial_layout.sanitized()));
+        let compare_cfg = Rc::new(Cell::new(CompareConfig::default()));
+        let frozen_state = Rc::new(Cell::new(false));
+        let fullscreen_active = Rc::new(Cell::new(false));
 
+        let init_l = layout_cell.get();
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Cyanide Studio")
-            .default_width(1280)
-            .default_height(800)
+            .default_width(init_l.window_width)
+            .default_height(init_l.window_height)
             .hide_on_close(true)
             .build();
 
@@ -92,30 +117,58 @@ impl MainWindow {
 
         // --- HeaderBar ---
         let header = adw::HeaderBar::new();
-        header.set_title_widget(Some(&adw::WindowTitle::new("Cyanide Studio", "")));
 
-        let status_pill = gtk4::Label::new(Some("● LIVE · Камера"));
-        status_pill.add_css_class("cyanide-status-pill");
-        status_pill.add_css_class("live");
-        header.pack_start(&status_pill);
+        let device_pill = gtk4::Label::new(Some("VirtualCam"));
+        device_pill.add_css_class("cyanide-status-pill");
+        device_pill.add_css_class("live");
+        header.pack_start(&device_pill);
 
-        let sidebar_btn = gtk4::ToggleButton::new();
-        sidebar_btn.set_icon_name("sidebar-show-right-symbolic");
-        sidebar_btn.set_active(true);
-        sidebar_btn.set_tooltip_text(Some("Показать/скрыть боковую панель"));
-        header.pack_end(&sidebar_btn);
+        let source_pill = gtk4::Label::new(Some("В эфире: Камера"));
+        source_pill.add_css_class("cyanide-status-pill");
+        source_pill.add_css_class("live");
 
         let toggle_btn = gtk4::Button::with_label("Переключить");
         toggle_btn.add_css_class("suggested-action");
-        toggle_btn.add_css_class("pill");
+        toggle_btn.add_css_class("cyanide-primary-cta");
+        toggle_btn.set_tooltip_text(Some(
+            "Переключить источник виртуальной камеры (Видео ↔ Камера)",
+        ));
         {
             let act = Rc::clone(&on_action);
             toggle_btn.connect_clicked(move |_| act(UiAction::Command(Command::Toggle)));
         }
-        header.pack_end(&toggle_btn);
 
-        let overlay_btn = make_icon_label_toggle("view-pin-symbolic", "Плавающее");
-        overlay_btn.set_tooltip_text(Some("Открыть/закрыть полупрозрачное окно совмещения"));
+        let center_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .valign(gtk4::Align::Center)
+            .build();
+        center_box.append(&source_pill);
+        center_box.append(&toggle_btn);
+        header.set_title_widget(Some(&center_box));
+
+        let sidebar_btn = gtk4::ToggleButton::new();
+        sidebar_btn.set_icon_name("sidebar-show-right-symbolic");
+        sidebar_btn.set_active(init_l.sidebar_visible);
+        sidebar_btn.set_tooltip_text(Some("Показать/скрыть панель выхода и настроек"));
+        header.pack_end(&sidebar_btn);
+
+        let fullscreen_btn = gtk4::ToggleButton::new();
+        fullscreen_btn.set_icon_name("view-fullscreen-symbolic");
+        fullscreen_btn.set_tooltip_text(Some("Полноэкранное сравнение (F11)"));
+        {
+            let act = Rc::clone(&on_action);
+            let s = Rc::clone(&syncing);
+            fullscreen_btn.connect_toggled(move |b| {
+                if !s.get() {
+                    act(UiAction::ToggleFullscreen(b.is_active()));
+                }
+            });
+        }
+        header.pack_end(&fullscreen_btn);
+
+        let overlay_btn = make_icon_label_toggle("view-pin-symbolic", "Оверлей");
+        overlay_btn.set_tooltip_text(Some("Открыть/закрыть полупрозрачное плавающее окно"));
         {
             let act = Rc::clone(&on_action);
             let s = Rc::clone(&syncing);
@@ -128,7 +181,7 @@ impl MainWindow {
         header.pack_end(&overlay_btn);
 
         let record_btn = gtk4::Button::with_label("● Запись");
-        record_btn.set_tooltip_text(Some("Записать видео с камеры на лету в MP4"));
+        record_btn.set_tooltip_text(Some("Записать видео с камеры в MP4"));
         {
             let act = Rc::clone(&on_action);
             record_btn.connect_clicked(move |_| {
@@ -140,61 +193,142 @@ impl MainWindow {
         let banner = adw::Banner::new("");
         banner.set_revealed(false);
 
-        // --- Main Split Studio Layout ---
+        // --- Resizable Two-Pane Studio Layout ---
         let workspace = VideoWorkspace::new(Rc::clone(&on_action), Rc::clone(&syncing));
         let controls = ControlPanel::new(&window, Rc::clone(&on_action), Rc::clone(&syncing));
-        let sidebar_sep = gtk4::Separator::new(gtk4::Orientation::Vertical);
+        controls.widget.set_visible(init_l.sidebar_visible);
+
+        let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        paned.set_start_child(Some(&workspace.widget));
+        paned.set_end_child(Some(&controls.widget));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(false);
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        paned.set_wide_handle(true);
+        let max_pos = (init_l.window_width - 380).max(420);
+        paned.set_position(init_l.split_position.clamp(420, max_pos));
+        paned.set_vexpand(true);
+        paned.set_hexpand(true);
 
         {
             let panel = controls.widget.clone();
-            let sep = sidebar_sep.clone();
+            let l_cell = Rc::clone(&layout_cell);
+            let s = Rc::clone(&syncing);
+            let fs = Rc::clone(&fullscreen_active);
+            let act = Rc::clone(&on_action);
             sidebar_btn.connect_toggled(move |b| {
+                if fs.get() {
+                    return;
+                }
                 let shown = b.is_active();
                 panel.set_visible(shown);
-                sep.set_visible(shown);
+                if !s.get() {
+                    let mut l = l_cell.get();
+                    l.sidebar_visible = shown;
+                    l_cell.set(l);
+                    act(UiAction::UpdateConfig(ConfigPatch::UiLayout(l)));
+                }
             });
         }
 
-        let body = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Horizontal)
-            .spacing(0)
-            .vexpand(true)
-            .build();
-        body.append(&workspace.widget);
-        body.append(&sidebar_sep);
-        body.append(&controls.widget);
+        {
+            let l_cell = Rc::clone(&layout_cell);
+            let s = Rc::clone(&syncing);
+            let fs = Rc::clone(&fullscreen_active);
+            let act = Rc::clone(&on_action);
+            let sidebar_ref = controls.widget.clone();
+            paned.connect_position_notify(move |p| {
+                if s.get() || fs.get() || !sidebar_ref.is_visible() {
+                    return;
+                }
+                let pos = p.position();
+                let mut l = l_cell.get();
+                if (l.split_position - pos).abs() >= 4 {
+                    l.split_position = pos;
+                    l_cell.set(l);
+                    act(UiAction::UpdateConfig(ConfigPatch::UiLayout(l)));
+                }
+            });
+        }
+
+        {
+            let l_cell = Rc::clone(&layout_cell);
+            let fs = Rc::clone(&fullscreen_active);
+            let paned_ref = paned.clone();
+            let act = Rc::clone(&on_action);
+            window.connect_close_request(move |w| {
+                if !fs.get() {
+                    let mut l = l_cell.get();
+                    let (ww, wh) = (w.width(), w.height());
+                    if ww >= 960 && wh >= 620 {
+                        l.window_width = ww;
+                        l.window_height = wh;
+                    }
+                    if paned_ref.position() >= 380 {
+                        l.split_position = paned_ref.position();
+                    }
+                    l_cell.set(l);
+                    act(UiAction::UpdateConfig(ConfigPatch::UiLayout(l)));
+                }
+                glib::Propagation::Proceed
+            });
+        }
 
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.append(&banner);
-        content_box.append(&body);
+        content_box.append(&paned);
 
-        // --- Bottom Studio Status Strip ---
-        let footer_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        // --- Bottom Studio Status Strip & Diagnostics Popover ---
+        let footer_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         footer_box.add_css_class("cyanide-footer");
 
-        let footer_label = gtk4::Label::new(Some("Режим: Настоящая камера · Аудио: Микрофон"));
+        let footer_label = gtk4::Label::new(Some("1280×720 · 30 FPS · VirtualCam"));
         footer_label.set_xalign(0.0);
         footer_label.set_hexpand(true);
-        footer_label.add_css_class("caption");
-        footer_label.add_css_class("dim-label");
+        footer_label.add_css_class("cyanide-caption");
 
         let lag_chip = gtk4::Label::new(Some("ЛАГ АКТИВЕН"));
         lag_chip.add_css_class("cyanide-lag-chip");
         lag_chip.set_visible(false);
 
-        let format_label = gtk4::Label::new(Some("1280×720 · 30 FPS"));
-        format_label.add_css_class("caption");
-        format_label.add_css_class("numeric");
-        format_label.add_css_class("dim-label");
-
         let hotkey_chip = gtk4::Label::new(None);
         hotkey_chip.add_css_class("cyanide-kbd-chip");
         hotkey_chip.set_visible(false);
 
+        let diag_label = gtk4::Label::new(Some("Ошибок не обнаружено. Все ветки работают штатно."));
+        diag_label.set_wrap(true);
+        diag_label.set_xalign(0.0);
+        diag_label.set_selectable(true);
+        diag_label.set_max_width_chars(56);
+        diag_label.add_css_class("cyanide-caption");
+
+        let diag_pop_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        let diag_title = gtk4::Label::new(Some("Диагностика устройств и конвейера"));
+        diag_title.set_xalign(0.0);
+        diag_title.add_css_class("cyanide-section-title");
+        diag_pop_box.append(&diag_title);
+        diag_pop_box.append(&diag_label);
+
+        let diag_popover = gtk4::Popover::builder().child(&diag_pop_box).build();
+        let diag_btn = gtk4::MenuButton::builder()
+            .label("Диагностика: OK")
+            .popover(&diag_popover)
+            .tooltip_text("Показать состояние виртуальных устройств и предупреждения")
+            .build();
+        diag_btn.add_css_class("cyanide-diag-btn");
+
         footer_box.append(&footer_label);
         footer_box.append(&lag_chip);
-        footer_box.append(&format_label);
         footer_box.append(&hotkey_chip);
+        footer_box.append(&diag_btn);
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header);
@@ -202,19 +336,118 @@ impl MainWindow {
         toolbar_view.add_bottom_bar(&footer_box);
         window.set_content(Some(&toolbar_view));
 
+        // --- Window Keyboard Shortcuts ---
+        let win_key = gtk4::EventControllerKey::new();
+        {
+            let act = Rc::clone(&on_action);
+            let fs = Rc::clone(&fullscreen_active);
+            let cmp = Rc::clone(&compare_cfg);
+            let frozen = Rc::clone(&frozen_state);
+            let win_weak = window.downgrade();
+            win_key.connect_key_pressed(move |_, key, _, _| {
+                if let Some(w) = win_weak.upgrade()
+                    && let Some(focused) = gtk4::prelude::RootExt::focus(&w)
+                    && focused.is::<gtk4::Editable>()
+                {
+                    return glib::Propagation::Proceed;
+                }
+                match key {
+                    gdk::Key::F11 => {
+                        act(UiAction::ToggleFullscreen(!fs.get()));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::Escape if fs.get() => {
+                        act(UiAction::ToggleFullscreen(false));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::_1 => {
+                        let mut c = cmp.get();
+                        c.mode = CompareMode::Overlay;
+                        cmp.set(c);
+                        act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::_2 => {
+                        let mut c = cmp.get();
+                        c.mode = CompareMode::SideBySide;
+                        cmp.set(c);
+                        act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::_3 => {
+                        let mut c = cmp.get();
+                        c.mode = CompareMode::Split;
+                        cmp.set(c);
+                        act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::space => {
+                        let next_frozen = !frozen.get();
+                        act(UiAction::Command(Command::SetFreeze {
+                            frozen: next_frozen,
+                        }));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::r | gdk::Key::R => {
+                        let mut c = cmp.get();
+                        c.reset_transforms();
+                        c.opacity = 0.5;
+                        c.split_pos = 0.5;
+                        cmp.set(c);
+                        act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                        glib::Propagation::Stop
+                    }
+                    gdk::Key::bracketleft => {
+                        let mut c = cmp.get();
+                        if c.mode == CompareMode::Overlay {
+                            c.opacity = (c.opacity - 0.1).clamp(0.0, 1.0);
+                            cmp.set(c);
+                            act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                            return glib::Propagation::Stop;
+                        }
+                        glib::Propagation::Proceed
+                    }
+                    gdk::Key::bracketright => {
+                        let mut c = cmp.get();
+                        if c.mode == CompareMode::Overlay {
+                            c.opacity = (c.opacity + 0.1).clamp(0.0, 1.0);
+                            cmp.set(c);
+                            act(UiAction::UpdateConfig(ConfigPatch::Compare(c)));
+                            return glib::Propagation::Stop;
+                        }
+                        glib::Propagation::Proceed
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            });
+        }
+        window.add_controller(win_key);
+
         Self {
             window,
-            status_pill,
+            toolbar_view,
+            paned,
+            header,
+            footer_box,
+            device_pill,
+            source_pill,
             toggle_btn,
             record_btn,
             overlay_btn,
+            fullscreen_btn,
+            sidebar_btn,
             banner,
             workspace,
             controls,
             footer_label,
-            format_label,
+            diag_btn,
+            diag_label,
             lag_chip,
             hotkey_chip,
+            layout: layout_cell,
+            compare_cfg,
+            frozen_state,
+            fullscreen_active,
             syncing,
         }
     }
@@ -229,6 +462,42 @@ impl MainWindow {
         self.controls.bind_output_paintable(out_p);
     }
 
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        let prev = self.syncing.replace(true);
+        self.fullscreen_active.set(fullscreen);
+        self.fullscreen_btn.set_active(fullscreen);
+        self.header.set_visible(!fullscreen);
+        self.footer_box.set_visible(!fullscreen);
+        self.toolbar_view.set_reveal_top_bars(!fullscreen);
+        self.toolbar_view.set_reveal_bottom_bars(!fullscreen);
+        if fullscreen {
+            self.controls.widget.set_visible(false);
+            self.window.fullscreen();
+        } else {
+            self.window.unfullscreen();
+            self.controls
+                .widget
+                .set_visible(self.layout.get().sidebar_visible);
+        }
+        self.workspace.set_fullscreen(fullscreen);
+        self.syncing.set(prev);
+    }
+
+    pub fn snapshot_layout(&self) -> UiLayoutConfig {
+        let mut l = self.layout.get();
+        if !self.fullscreen_active.get() {
+            let (ww, wh) = (self.window.width(), self.window.height());
+            if ww >= 960 && wh >= 620 {
+                l.window_width = ww;
+                l.window_height = wh;
+            }
+            if l.sidebar_visible && self.paned.position() >= 380 {
+                l.split_position = self.paned.position();
+            }
+        }
+        l.sanitized()
+    }
+
     pub fn sync_state(
         &self,
         cfg: &Config,
@@ -239,53 +508,86 @@ impl MainWindow {
     ) {
         let prev = self.syncing.replace(true);
 
+        self.compare_cfg.set(cfg.compare);
+        self.frozen_state.set(state.frozen_reference);
+        self.layout.set(cfg.ui);
+
+        if !self.fullscreen_active.get() {
+            self.sidebar_btn.set_active(cfg.ui.sidebar_visible);
+            self.controls.widget.set_visible(cfg.ui.sidebar_visible);
+            let avail_w = self.window.width().max(cfg.ui.window_width);
+            let clamped_pos = cfg.ui.split_position.clamp(420, (avail_w - 380).max(420));
+            if (self.paned.position() - clamped_pos).abs() >= 2 {
+                self.paned.set_position(clamped_pos);
+            }
+        }
+
+        let target_label = match state.mode.video() {
+            VideoSource::Live => "Включить Видео",
+            VideoSource::Loop => "Включить Камеру",
+        };
         if let Some(ref hk) = cfg.hotkey {
-            self.toggle_btn.set_label(&format!("Переключить ({hk})"));
+            self.toggle_btn.set_label(&format!("{target_label} ({hk})"));
             self.hotkey_chip.set_label(hk);
             self.hotkey_chip.set_visible(true);
         } else {
-            self.toggle_btn.set_label("Переключить");
+            self.toggle_btn.set_label(target_label);
             self.hotkey_chip.set_visible(false);
         }
         if self.overlay_btn.is_active() != overlay_visible {
             self.overlay_btn.set_active(overlay_visible);
         }
 
-        let (mode_short, mode_text, pill_cls) = match state.mode {
-            StreamMode::Loop => ("● LOOP · Видео", "Зацикленное видео", "loop"),
-            StreamMode::Live => ("● LIVE · Камера", "Настоящая камера", "live"),
+        // VirtualCam device status pill (independent of selected video source).
+        for cls in ["live", "warn"] {
+            self.device_pill.remove_css_class(cls);
+        }
+        if state.health.output_warning.is_some() || cfg.virtual_camera.is_none() {
+            self.device_pill.set_label("Заглушка");
+            self.device_pill.add_css_class("warn");
+            self.device_pill.set_tooltip_text(
+                state
+                    .health
+                    .output_warning
+                    .as_deref()
+                    .or(Some("Устройство v4l2loopback не найдено")),
+            );
+        } else {
+            self.device_pill.set_label("VirtualCam");
+            self.device_pill.add_css_class("live");
+            self.device_pill
+                .set_tooltip_text(cfg.virtual_camera.as_deref());
+        }
+
+        // Active output source pill (never masked by recording state).
+        for cls in ["live", "loop", "custom"] {
+            self.source_pill.remove_css_class(cls);
+        }
+        let (src_text, src_cls) = match state.mode {
+            StreamMode::Loop => ("В эфире: Видео", "loop"),
+            StreamMode::Live => ("В эфире: Камера", "live"),
             StreamMode::Custom { video, .. } => match video {
-                VideoSource::Loop => ("● CUSTOM · MP4", "Custom (Видео: MP4)", "custom"),
-                VideoSource::Live => ("● CUSTOM · Камера", "Custom (Видео: Камера)", "custom"),
+                VideoSource::Loop => ("В эфире: Видео (аудио отд.)", "custom"),
+                VideoSource::Live => ("В эфире: Камера (аудио отд.)", "custom"),
             },
         };
-        let audio_text = if !state.virtual_mic_enabled {
-            "Выключён (Mute)"
-        } else {
+        self.source_pill.set_label(src_text);
+        self.source_pill.add_css_class(src_cls);
+
+        let vcam_str = cfg.virtual_camera.as_deref().unwrap_or("нет v4l2loopback");
+        let mic_str = if state.virtual_mic_enabled {
             match state.mode.audio() {
                 AudioSource::File => "Звук MP4",
-                AudioSource::Mic => "Настоящий микрофон",
-                AudioSource::Mix => "Смесь (MP4 + микрофон)",
+                AudioSource::Mic => "Микрофон",
+                AudioSource::Mix => "Смесь",
                 AudioSource::Silence => "Тишина",
             }
-        };
-
-        for cls in ["live", "loop", "custom", "recording"] {
-            self.status_pill.remove_css_class(cls);
-        }
-        if state.recording {
-            self.status_pill.set_label("● ЗАПИСЬ");
-            self.status_pill.add_css_class("recording");
         } else {
-            self.status_pill.set_label(mode_short);
-            self.status_pill.add_css_class(pill_cls);
-        }
-
-        self.footer_label
-            .set_label(&format!("Режим: {mode_text} · Аудио: {audio_text}"));
-        self.format_label.set_label(&format!(
-            "{}×{} · {} FPS",
-            cfg.video.width, cfg.video.height, cfg.video.fps
+            "Mute"
+        };
+        self.footer_label.set_label(&format!(
+            "{}×{} · {} FPS · Выход: {} · VirtualCamMic: {}",
+            cfg.video.width, cfg.video.height, cfg.video.fps, vcam_str, mic_str
         ));
         self.lag_chip
             .set_visible(cfg.lag.enabled || cfg.lag.freeze_on_switch);
@@ -298,11 +600,25 @@ impl MainWindow {
         .into_iter()
         .flatten()
         .collect();
+
         if warnings.is_empty() {
             self.banner.set_revealed(false);
+            self.diag_btn.set_label("Диагностика: OK");
+            self.diag_btn.remove_css_class("has-warning");
+            self.diag_label
+                .set_label("Ошибок не обнаружено. Все ветки работают штатно.");
         } else {
-            self.banner.set_title(&warnings.join(" | "));
-            self.banner.set_revealed(true);
+            let has_fatal = warnings.iter().any(|w| w.starts_with("Ошибка"));
+            if has_fatal {
+                self.banner.set_title(&warnings.join(" | "));
+                self.banner.set_revealed(true);
+            } else {
+                self.banner.set_revealed(false);
+            }
+            self.diag_btn
+                .set_label(&format!("⚠ Диагностика ({})", warnings.len()));
+            self.diag_btn.add_css_class("has-warning");
+            self.diag_label.set_label(&warnings.join("\n\n"));
         }
 
         self.workspace.sync_state(cfg, state);

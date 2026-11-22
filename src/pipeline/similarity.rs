@@ -28,6 +28,7 @@ struct MatcherState {
 /// Computes brightness-invariant similarity (ZNCC) between downsampled Loop and Live frames.
 pub struct FrameMatcher {
     state: Mutex<MatcherState>,
+    enabled: AtomicBool,
     frozen: AtomicBool,
     last_loop_ms: AtomicU64,
     last_live_ms: AtomicU64,
@@ -42,13 +43,31 @@ impl Default for FrameMatcher {
 
 impl FrameMatcher {
     pub fn new() -> Self {
+        Self::with_enabled(false)
+    }
+
+    pub fn with_enabled(enabled: bool) -> Self {
         Self {
             state: Mutex::new(MatcherState::default()),
+            enabled: AtomicBool::new(enabled),
             frozen: AtomicBool::new(false),
             last_loop_ms: AtomicU64::new(0),
             last_live_ms: AtomicU64::new(0),
             score_bits: AtomicU32::new(0.0f32.to_bits()),
         }
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.last_loop_ms.store(0, Ordering::Relaxed);
+            self.last_live_ms.store(0, Ordering::Relaxed);
+            self.reset();
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
     }
 
     pub fn set_frozen(&self, frozen: bool) {
@@ -70,6 +89,9 @@ impl FrameMatcher {
 
     /// Samples a GStreamer video buffer at most once per `SAMPLE_INTERVAL_MS` per side.
     pub fn on_buffer(&self, side: FrameSide, info: &gst_video::VideoInfo, buf: &gst::BufferRef) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
         if side == FrameSide::Loop && self.frozen.load(Ordering::Acquire) {
             return;
         }
@@ -100,6 +122,9 @@ impl FrameMatcher {
     }
 
     pub fn push_grid(&self, side: FrameSide, grid: [u8; GRID_CELLS]) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
         if side == FrameSide::Loop && self.frozen.load(Ordering::Acquire) {
             return;
         }
@@ -307,7 +332,7 @@ mod tests {
 
     #[test]
     fn frame_matcher_respects_frozen_reference() {
-        let matcher = FrameMatcher::new();
+        let matcher = FrameMatcher::with_enabled(true);
         let a = synthetic_portrait(0, 0);
         let b = synthetic_portrait(10, 0);
 
@@ -320,5 +345,29 @@ mod tests {
         matcher.push_grid(FrameSide::Loop, b);
         matcher.push_grid(FrameSide::Live, a);
         assert!(matcher.score() > 0.95);
+    }
+
+    #[test]
+    fn frame_matcher_disabled_by_default_and_skips_updates() {
+        let matcher = FrameMatcher::new();
+        assert!(!matcher.is_enabled());
+        let a = synthetic_portrait(0, 0);
+
+        matcher.push_grid(FrameSide::Loop, a);
+        matcher.push_grid(FrameSide::Live, a);
+        assert_eq!(matcher.score(), 0.0);
+
+        matcher.set_enabled(true);
+        assert!(matcher.is_enabled());
+        matcher.push_grid(FrameSide::Loop, a);
+        matcher.push_grid(FrameSide::Live, a);
+        assert!(matcher.score() > 0.95);
+
+        matcher.set_enabled(false);
+        assert!(!matcher.is_enabled());
+        assert_eq!(matcher.score(), 0.0);
+        matcher.push_grid(FrameSide::Loop, a);
+        matcher.push_grid(FrameSide::Live, a);
+        assert_eq!(matcher.score(), 0.0);
     }
 }
